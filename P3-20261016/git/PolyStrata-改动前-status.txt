@@ -1,0 +1,48 @@
+﻿# PolyStrata 改动前 status/diff-stat（留痕席 keeper 落盘）
+# 时间：2026-10-18 02:03:31 +08:00
+# 仓库：E:\视频\_flashnext\experiments\20261015-nemotron-on-strata\PolyStrata
+# 分支/HEAD：main / eb5ef118cc063e8f7b008e470a5dc9485379a141
+# remote：origin	https://github.com/VecSzn/PolyStrata (fetch)
+
+===== git status --porcelain =====
+ M CMakeLists.txt
+ M include/strata/poly/kernels.hpp
+ M src/poly/cpu_experts.cpp
+ M src/poly/cpu_experts.hpp
+ M src/poly/engine.cpp
+ M src/poly/engine.hpp
+ M src/poly/kernels.cu
+ M src/poly/main.cpp
+ M src/poly/qwen35.cpp
+ M src/poly/runtime.hpp
+?? src/poly/nemotron_moe_test.cu
+?? src/poly/nemotronhmoe.cpp
+?? src/poly/nemotronhmoe.hpp
+?? src/poly/threads.hpp
+
+===== git diff --stat =====
+ CMakeLists.txt                  |   10 +-
+ include/strata/poly/kernels.hpp |   27 +
+ src/poly/cpu_experts.cpp        |   38 +-
+ src/poly/cpu_experts.hpp        |    4 +-
+ src/poly/engine.cpp             | 1067 ++++++++++++++++++++++++++++++++++-----
+ src/poly/engine.hpp             |  120 ++++-
+ src/poly/kernels.cu             |  431 ++++++++++++++++
+ src/poly/main.cpp               |  109 +++-
+ src/poly/qwen35.cpp             |    1 +
+ src/poly/runtime.hpp            |   10 +-
+ 10 files changed, 1667 insertions(+), 150 deletions(-)
+
+===== untracked 文件大小 =====
+    6702 B  src/poly/nemotron_moe_test.cu
+   22135 B  src/poly/nemotronhmoe.cpp
+    4541 B  src/poly/nemotronhmoe.hpp
+   12582 B  src/poly/threads.hpp
+
+===== build-p3 exe（只读 metadata，未 hash 未触碰） =====
+    65438208 B  mtime 2026-10-18 01:48:43
+
+===== 说明 =====
+1) 改动为多天累积本地补丁 + 今晚（2026-10-17→18）新增，不是上游提交。
+2) build*/ 已在仓库 .gitignore 中，故 build-p3 不出现在 status；本席不碰 build-p3。
+3) 落盘时刻源码仍在被 builder2 编辑（engine.cpp/main.cpp mtime 02:02），本文件是快照。

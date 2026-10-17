@@ -1,0 +1,38 @@
+﻿# PolyStrata 提交后 git show --stat HEAD（留痕席 keeper 落盘）
+# 时间：2026-10-18 02:04:26 +08:00（署名校正后重跑）
+# 分支：wip/nemotron-on-sss-strata-20261018
+# commit：9b0e0de0ecb17f50eca2eea739c11dc0c5174ded
+# 说明：首个提交先在临时身份 keeper <keeper@local> 下生成（hash 4cf0ceba1c94195d1d984b761319e6c08dc04e29），
+#       按 lead 署名令用 --amend --reset-author 校正为项目身份；树内容与 message 未变，
+#       未 push、未改写任何他人提交。
+
+===== git show --stat HEAD =====
+commit 9b0e0de0ecb17f50eca2eea739c11dc0c5174ded
+Author: Nemotron on SSS-Strata <nemotron-on-sss-strata@localhost>
+Date: Sun Oct 18 02:04:26 2026 +0800
+
+nemotron on sss-strata: wip 本地累积补丁（去重 / ring / route 单遍 / 线程放置 / 旋钮 / pcie 骨架）
+
+
+ CMakeLists.txt                  |   10 +-
+ include/strata/poly/kernels.hpp |   27 +
+ src/poly/cpu_experts.cpp        |   38 +-
+ src/poly/cpu_experts.hpp        |    4 +-
+ src/poly/engine.cpp             | 1067 ++++++++++++++++++++++++++++++++++-----
+ src/poly/engine.hpp             |  120 ++++-
+ src/poly/kernels.cu             |  431 ++++++++++++++++
+ src/poly/main.cpp               |  109 +++-
+ src/poly/nemotron_moe_test.cu   |  161 ++++++
+ src/poly/nemotronhmoe.cpp       |  427 ++++++++++++++++
+ src/poly/nemotronhmoe.hpp       |   89 ++++
+ src/poly/qwen35.cpp             |    1 +
+ src/poly/runtime.hpp            |   10 +-
+ src/poly/threads.hpp            |  261 ++++++++++
+ 14 files changed, 2605 insertions(+), 150 deletions(-)
+
+===== git status --porcelain（提交后即时） =====
+
+===== git log --oneline -3 =====
+9b0e0de0 nemotron on sss-strata: wip 本地累积补丁（去重 / ring / route 单遍 / 线程放置 / 旋钮 / pcie 骨架）
+eb5ef118 setup: say LFM2.5's own speeds when it asks for the context
+445aaaad docs: LFM2.5 with a context of 128K

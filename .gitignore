@@ -1,0 +1,64 @@
+# nemotron on sss-strata —— 实验产出仓（仅文档类）
+# 规则：源码在独立仓 PolyStrata/；本仓只收 .md 文档与 .cmd 小脚本 + 本席 git 留痕证据。
+# 不进仓：对话记录/个人记忆/大文件/日志/数据/构建产物（见下方逐类排除）。
+
+# ---------- 独立仓库与本地大目录 ----------
+PolyStrata/
+_backups/
+_p3/
+_u4b/
+_u14/
+_inspect/
+llama-cpp-pin/
+upstream-0.1.44.1/
+build*/
+__pycache__/
+.pytest_cache/
+
+# ---------- 二进制 / 模型 / 制品 ----------
+*.gguf
+*.exe
+*.bin
+*.obj
+*.dll
+*.so
+*.a
+*.lib
+*.zip
+*.7z
+*.tar
+*.gz
+*.sqlite
+*.nsys-rep
+*.ncu-rep
+*.npz
+*.occ1
+
+# ---------- 日志 / 数据 / 脚本工具（只收 .md 与 .cmd） ----------
+*.log
+*.csv
+*.txt
+*.py
+*.ps1
+*.ids
+*.jsonl
+*.json
+*.stdout
+*.err
+*.done
+*.cu
+*.cpp
+*.hpp
+*.h
+_meta/
+
+# ---------- 对话记录 / 个人记忆（硬禁止） ----------
+USER.md
+MEMORY.md
+_agents/
+*transcript*
+*对话记录*
+
+# ---------- 例外：本席本次建仓的 git 证据（纯文本、小） ----------
+!P3-20261016/git/*.txt
+!P3-20261016/git/.commitmsg-PolyStrata.txt
