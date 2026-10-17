@@ -1,0 +1,42 @@
+# 合并后内容闸门读数 —— nemotron on sss-strata（2026-10-18 02:3x，单仓）
+
+# 仓库根：E:\视频\_flashnext\experiments\20261015-nemotron-on-strata
+# 合并提交：见 git log --oneline -1（本文件随该提交入库，不自引用）
+
+门 1：git grep --cached -n （4 类对话引语标记）
+  读数：0 命中
+  复跑（HEAD 上）：git grep -n "用户[原]话\|用户[说]\|用户[点]名\|用户[裁]定" HEAD   # 中括号=同正则，防本文件自命中
+
+门 2：git ls-files --cached | grep -Ei "transcript|USER\.md|MEMORY\.md|_agents"
+  读数：0 命中
+
+门 3：文件数
+  git ls-files --cached 总数 = 3,612
+  git ls-files --cached PolyStrata = 3,297（= A 仓合并前跟踪数，保真）
+  新增文档（相对合并前 304）= 11
+
+例外与裁定（不是违规，勿再处理）：
+  - PolyStrata 的 59 个 .jsonl = 上游 PolyStrata 自带 bench/results/**/*.jsonl 跑测遥测件（上游历史文件，非对话）
+  - 2 个 >1MB 文件 = 上游 docs/media 配图（webp 9,605,276 B / gif 1,792,154 B）；"无 >1MB"只约束本项目新增文件
+  - 30 条上游 tracked-but-ignored 小文件（28 .log + 2 build-recipes/*.sh，254,870 B）为保真显式 -f 加入，非本实验产物
+
+备份：E:\视频\_backups\20261018-git-merge\PolyStrata-dotgit\（40,134,736 B / 84 文件）
+
+# ---- WIP 标注读数（lead 2026-10-18 硬要求：git grep 施工中|暂无成品方案|WIP 应 >=3 命中）----
+# staged 实测命中数 = 22
+# 关键命中（前 15 行）：
+#   G2c-ncols13来源-20261016.md:164:2. `L.exp_in` / `L.latent_down` 的**赋值处未读**（它们是新加的字段，`engine.cpp` 与 `nemotronhmoe.cpp` 都在施工中）—— 本件只用了"`in_w` 取 `L.exp_in`"这一处读取，`= 1024` 由 cell-probe 实测反推。
+#   G2c-ncols13来源-20261016.md:166:4. §4 的归属更正**依赖**"`ggml_type==8` 才可达 `q8_packed_mmvq`"这条**代码结构**判断；若施工中有人**改了 dispatcher**，需重核。
+#   P3-20261016/git/.commitmsg-PolyStrata-v2.txt:1:nemotron on sss-strata: 本地累积补丁快照（Compile #1 + Compile #2 pcie 分流 v1，施工中快照）
+#   P3-20261016/git/.commitmsg-PolyStrata-v2.txt:12:- Compile #2（本快照时施工中）：**pcie 分流 v1 逻辑**（源码已在本快照中；尚未编译、未验）。
+#   P3-20261016/git/GIT-台账-20261018.md:11:> ## ⚠️ 施工中（WIP）
+#   P3-20261016/git/GIT-台账-20261018.md:12:> 本项目**处于施工阶段，暂无成品方案**；现有读数与结论均为过程证据，不构成交付承诺。
+#   P3-20261016/git/GIT-台账-20261018.md:19:   - A：`Nemotron on SSS-Strata <nemotron-on-sss-strata@localhost> | nemotron on sss-strata: 本地累积补丁快照（Compile #1 + Compile #2 pcie 分流 v1，施工中快照）`
+#   P3-20261016/git/GIT-台账-20261018.md:37:  - A 署名行：`Nemotron on SSS-Strata <nemotron-on-sss-strata@localhost> | nemotron on sss-strata: 本地累积补丁快照（Compile #1 + Compile #2 pcie 分流 v1，施工中快照）`
+#   P3-20261016/git/GIT-台账-20261018.md:197:1. **builder2 正在改源**：提交前采样到 `engine.cpp`（02:02:49）、`main.cpp`（02:02:21）、`engine.hpp`（02:01:44）刚被 builder2 编辑；本席在 02:03:47 采样到静默后提交，提交后 02:10:19 与 02:11 复核 `git status` 均为空。**若 builder2 之后继续改，那是新的 WIP，不在本提交内。**
+#   P3-20261016/git/PolyStrata-提交后-show-stat.txt:15:nemotron on sss-strata: 本地累积补丁快照（Compile #1 + Compile #2 pcie 分流 v1，施工中快照）
+#   P3-20261016/git/PolyStrata-提交后-show-stat.txt:35:1bdcddea nemotron on sss-strata: 本地累积补丁快照（Compile #1 + Compile #2 pcie 分流 v1，施工中快照）
+#   P3-20261016/回执/RK-20261018-建仓.md:18:  - `1bdcddea 2026-10-18 02:04:26 +0800 Nemotron on SSS-Strata <nemotron-on-sss-strata@localhost> | nemotron on sss-strata: 本地累积补丁快照（Compile #1 + Compile #2 pcie 分流 v1，施工中快照）`
+#   P3-20261016/回执/RK-20261018-建仓.md:63:## 8. WIP 标注（lead 2026-10-18 02:2x 硬要求）
+#   P3-20261016/回执/RK-20261018-建仓.md:65:- **README 顶部 banner**（前 5 行内）：`⚠️ 施工中（WIP）` + "处于施工阶段，暂无成品方案；现有读数与结论均为过程证据，不构成交付承诺。有思路 / 想一起研究，欢迎参与。"
+#   P3-20261016/回执/RK-20261018-建仓.md:68:  `nemotron on sss-strata: **WIP — 施工中，暂无成品方案，有思路可参与研究**；单仓合并（源码 3,297 文件 + 研发台账）`

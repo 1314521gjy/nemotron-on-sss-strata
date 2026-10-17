@@ -1,6 +1,10 @@
+> ## ⚠️ 施工中（WIP）
+> 本项目**处于施工阶段，暂无成品方案**；现有读数与结论均为过程证据，不构成交付承诺。
+> 有思路 / 想一起研究，欢迎参与（issues/讨论见仓内 `P3-20261016\` 的路线与判据）。
+
 # Nemotron on SSS-Strata
 
-本仓是 2026-10-15→18 Nemotron-on-Strata 实验的**研发路线、判据、注意事项与回执存档**；源码在独立仓库 `PolyStrata`。
+本仓是 2026-10-15→18 Nemotron-on-Strata 实验的**研发路线、判据、注意事项与回执存档**；源码树 `PolyStrata\` 与本文档**同在本仓**（2026-10-18 单仓合并；上游历史保留在 `PolyStrata\.git-upstream`）。
 
 ## 目录
 
@@ -24,4 +28,4 @@
 - 项目：Nemotron on SSS-Strata
 - 留痕：本仓为本次研发过程的路线、判据、注意事项与回执存档
 - 提交身份：Nemotron on SSS-Strata <nemotron-on-sss-strata@localhost>
-- 源码仓：PolyStrata（独立仓，分支 wip/nemotron-on-sss-strata-20261018）
+- 源码：本仓 `PolyStrata\`（2026-10-18 单仓合并；上游历史保留在 `PolyStrata\.git-upstream`）

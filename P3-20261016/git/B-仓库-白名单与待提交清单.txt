@@ -1,0 +1,36 @@
+﻿# B 仓 .gitignore 白名单 / 待提交文件 生效证据（冻结中，未 add 未 commit）
+# 时间：2026-10-18 02:13:29 +08:00
+# 背景：.gitignore 排除 `*.txt`；P3-20261016/git/ 下的证据 txt 依赖白名单 `!P3-20261016/git/*.txt` 才能入库。
+# 证据 A：git check-ignore -q（0=被忽略 / 1=未被忽略）
+rc=1  P3-20261016/git/GIT-台账-20261018.md
+rc=1  P3-20261016/git/B-仓库-建仓后-status.txt
+rc=1  P3-20261016/git/B-仓库-ls-files.txt
+rc=1  P3-20261016/git/B-仓库-内容闸门读数.txt
+rc=1  P3-20261016/git/PolyStrata-留痕后-status.txt
+rc=1  P3-20261016/git/PolyStrata-改动前-status.txt
+rc=1  P3-20261016/git/PolyStrata-提交后-show-stat.txt
+rc=1  P3-20261016/git/.commitmsg-PolyStrata-v2.txt
+rc=1  P3-20261016/回执/RK-20261018-建仓.md
+rc=1  P3-20261016/回执/R26-pcie分流v1-20261018.md
+
+# 证据 B：git add --dry-run（只演算，不改 index/工作树）
+add 'P3-20261016/git/PolyStrata-提交后-show-stat.txt'
+add 'P3-20261016/git/.commitmsg-PolyStrata-v2.txt'
+add 'P3-20261016/git/B-仓库-ls-files.txt'
+add 'P3-20261016/git/B-仓库-内容闸门读数.txt'
+add 'P3-20261016/git/B-仓库-建仓后-status.txt'
+add 'P3-20261016/git/GIT-台账-20261018.md'
+add 'P3-20261016/git/PolyStrata-留痕后-status.txt'
+add 'P3-20261016/回执/R26-pcie分流v1-20261018.md'
+add 'P3-20261016/回执/RK-20261018-建仓.md'
+
+# 证据 C：git status --porcelain（?? = untracked 且未被忽略，待放行后 add）
+ M P3-20261016/git/PolyStrata-提交后-show-stat.txt
+?? P3-20261016/git/.commitmsg-PolyStrata-v2.txt
+?? P3-20261016/git/B-仓库-ls-files.txt
+?? P3-20261016/git/B-仓库-内容闸门读数.txt
+?? P3-20261016/git/B-仓库-建仓后-status.txt
+?? P3-20261016/git/GIT-台账-20261018.md
+?? P3-20261016/git/PolyStrata-留痕后-status.txt
+?? P3-20261016/回执/R26-pcie分流v1-20261018.md
+?? P3-20261016/回执/RK-20261018-建仓.md

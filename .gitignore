@@ -1,9 +1,8 @@
-# nemotron on sss-strata —— 实验产出仓（仅文档类）
-# 规则：源码在独立仓 PolyStrata/；本仓只收 .md 文档与 .cmd 小脚本 + 本席 git 留痕证据。
-# 不进仓：对话记录/个人记忆/大文件/日志/数据/构建产物（见下方逐类排除）。
+# nemotron on sss-strata —— 单仓（2026-10-18 合并：源码 + 研发台账）
+# 规则：一个仓 = 源码树 PolyStrata/（收源码、排构建产物）+ 研发路线/判据/注意事项/回执（.md）+ 小 .cmd 脚本 + git 留痕证据。
+# 不进仓：对话记录/个人记忆/构建产物/日志/数据/大文件（见下方逐类排除与“单仓合并”段）。
 
-# ---------- 独立仓库与本地大目录 ----------
-PolyStrata/
+# ---------- 本地大目录（源码树已并入本仓，见下方“单仓合并”段） ----------
 _backups/
 _p3/
 _u4b/
@@ -58,6 +57,17 @@ MEMORY.md
 _agents/
 *transcript*
 *对话记录*
+
+# ---------- 单仓合并（2026-10-18）：上游 PolyStrata 源树 = 收源码、排构建产物 ----------
+# 先整体放行源码树（覆盖本文件前面的“文档仓”宽排除：*.txt/*.py/*.cu/*.cpp/*.h/*.jsonl 等）；
+# 其余构建物/日志由 PolyStrata 自带 .gitignore（更深层，优先级更高）二次拦截。
+!PolyStrata/**
+# 内部状态 / 本地工具目录 / 断链 worktree / 构建目录：放行之后必须再排
+PolyStrata/.git-upstream/
+PolyStrata/.git/
+PolyStrata/.claude/
+PolyStrata/build*/
+PolyStrata/**/build*/
 
 # ---------- 例外：本席本次建仓的 git 证据（纯文本、小） ----------
 !P3-20261016/git/*.txt

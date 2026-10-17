@@ -1,17 +1,18 @@
-﻿# PolyStrata 提交后 git show --stat HEAD（留痕席 keeper 落盘）
-# 时间：2026-10-18 02:04:26 +08:00（署名校正后重跑）
+﻿# PolyStrata 提交后 git show --stat HEAD（留痕席 keeper 落盘；已按 lead 指令只更正 message）
+# 时间：2026-10-18 02:11:57 +08:00
 # 分支：wip/nemotron-on-sss-strata-20261018
-# commit：9b0e0de0ecb17f50eca2eea739c11dc0c5174ded
-# 说明：首个提交先在临时身份 keeper <keeper@local> 下生成（hash 4cf0ceba1c94195d1d984b761319e6c08dc04e29），
-#       按 lead 署名令用 --amend --reset-author 校正为项目身份；树内容与 message 未变，
+# commit：1bdcddeaa85f2ff99e7e29accd541a8687bacb87
+# 说明：首个提交在临时身份 keeper 下生成（4cf0ceba），按署名令 amend 作者（9b0e0de0）；
+#       后按 lead 指令 [只改 message 不改内容] 再 amend 一次（9b0e0de0 -> 当前 hash）；
+#       三次树对象完全相同：ba49b91843933a97036eb51d85351b50613d541d，证明内容未变。
 #       未 push、未改写任何他人提交。
 
 ===== git show --stat HEAD =====
-commit 9b0e0de0ecb17f50eca2eea739c11dc0c5174ded
+commit 1bdcddeaa85f2ff99e7e29accd541a8687bacb87
 Author: Nemotron on SSS-Strata <nemotron-on-sss-strata@localhost>
 Date: Sun Oct 18 02:04:26 2026 +0800
 
-nemotron on sss-strata: wip 本地累积补丁（去重 / ring / route 单遍 / 线程放置 / 旋钮 / pcie 骨架）
+nemotron on sss-strata: 本地累积补丁快照（Compile #1 + Compile #2 pcie 分流 v1，施工中快照）
 
 
  CMakeLists.txt                  |   10 +-
@@ -30,9 +31,9 @@ nemotron on sss-strata: wip 本地累积补丁（去重 / ring / route 单遍 / 
  src/poly/threads.hpp            |  261 ++++++++++
  14 files changed, 2605 insertions(+), 150 deletions(-)
 
-===== git status --porcelain（提交后即时） =====
-
 ===== git log --oneline -3 =====
-9b0e0de0 nemotron on sss-strata: wip 本地累积补丁（去重 / ring / route 单遍 / 线程放置 / 旋钮 / pcie 骨架）
+1bdcddea nemotron on sss-strata: 本地累积补丁快照（Compile #1 + Compile #2 pcie 分流 v1，施工中快照）
 eb5ef118 setup: say LFM2.5's own speeds when it asks for the context
 445aaaad docs: LFM2.5 with a context of 128K
+
+===== git status --porcelain =====
