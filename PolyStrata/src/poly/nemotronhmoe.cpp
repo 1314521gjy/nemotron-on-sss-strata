@@ -47,6 +47,11 @@ void NemotronHMoe::begin_pass() {
 // only a cross-check here.
 NemotronHMoe::Kind NemotronHMoe::kind_of(int il) const {
     if (tensor(il, "ssm_in.weight")) return kMamba;
+    // The NextN/MTP block is the one block with both an attention sub-layer and a MoE sub-layer: llama.cpp's
+    // nemotron-h creates attn_q and ffn_gate_inp for it (nemotron-h.cpp:142-181).  It must be seen here, or the
+    // attention half is silently dropped and the block is loaded as a plain MoE layer (the R29 finding: 0-4%
+    // acceptance because the draft block had no attention).
+    if (tensor(il, "attn_q.weight") && tensor(il, "ffn_gate_inp.weight")) return kAttnMoe;
     if (tensor(il, "ffn_gate_inp.weight")) return kMoe;
     if (tensor(il, "attn_q.weight")) return kAttn;
     throw std::runtime_error("nemotron_h_moe: layer " + std::to_string(il) +
@@ -138,12 +143,13 @@ void NemotronHMoe::load_layer(int il) {
     // counted here, not in load_geometry: begin_pass() resets them before every pass, so the count that alloc() and
     // recurrent_floats() read is the one this pass left (load_geometry's own count was wiped by begin_pass - the
     // 8585-experts smoke caught it as an illegal access when the Mamba state turned out to be zero floats).
-    if (B.kind == kAttn) ++n_attn_;
-    else if (B.kind == kMamba) ++n_mamba_;
-    else ++n_moe_;
+    // The MTP block counts on both sides: its attention cache and its routed experts exist.
+    if (B.kind == kAttn || B.kind == kAttnMoe) ++n_attn_;
+    if (B.kind == kMamba) ++n_mamba_;
+    if (B.kind == kMoe || B.kind == kAttnMoe) ++n_moe_;
     L.fixed = true;
 
-    if (B.kind == kAttn) {
+    if (B.kind == kAttn || B.kind == kAttnMoe) {
         // llama.cpp nemotron-h.cpp:91-98: q/k/v then the output; the q and k norms and the output bias are optional
         B.wq = mat("attn_q.weight", n_embd_, (int64_t) n_head_ * head_dim_);
         B.wk = mat("attn_k.weight", n_embd_, (int64_t) n_kv_ * head_dim_);
@@ -152,7 +158,10 @@ void NemotronHMoe::load_layer(int il) {
         B.k_norm = tensor(il, "attn_k_norm.weight") ? f32("attn_k_norm.weight", head_dim_) : Dev{};
         B.wo = mat("attn_output.weight", (int64_t) n_head_ * head_dim_, n_embd_);
         B.wo_b = tensor(il, "attn_output.bias") ? f32("attn_output.bias", n_embd_) : Dev{};
-        return;
+        if (B.kind == kAttn) return;
+        // the MTP block, second half: its pre-FFN norm is a tensor of its own (only this block has it).  The engine's
+        // draft_step() norms with Layer::ffn_norm before the experts, which was a null weight before this line.
+        L.ffn_norm = f32("post_attention_norm.weight", n_embd_);
     }
 
     if (B.kind == kMamba) {
@@ -199,7 +208,7 @@ void NemotronHMoe::alloc_caches() {
     for (int il = 0; il < (int) blocks_.size(); ++il) {
         Block& B = blocks_[(size_t) il];
         if (!runs(il)) continue;
-        if (B.kind == kAttn) {
+        if (B.kind == kAttn || B.kind == kAttnMoe) {
             B.keys = (uint16_t*) kv_alloc(row, 1);
             B.vals = (uint16_t*) kv_alloc(row, 1);
         } else if (B.kind == kMamba) {
@@ -351,6 +360,44 @@ void NemotronHMoe::layer_head(Layer& L, int il, int n) {
 void NemotronHMoe::layer_tail(Layer& L, int il, int n) {
     if (blocks_[(size_t) il].kind != kMoe) return;
     axpy(fo_, 1.f, r_, n * n_embd_, true, st_);
+}
+
+// The NextN/MTP block (llama.cpp nemotron-h.cpp:142-181): one block, an attention sub-layer and a MoE sub-layer.
+// The trunk's layer() never runs it; the engine's draft_rows() and draft_step() do, through the two calls below.
+//
+// The block's attention keeps its own key/value rows for the model's own tokens: draft_rows() has already fused the
+// block's input into xn_/xq_, so this is the same projection and the same cache write attn() makes, without the
+// attention itself and without the output projection (a row of keys and values is all a later guess reads).
+void NemotronHMoe::block_rows(int64_t pos, int n) {
+    Block& B = blocks_[(size_t) n_layer_];
+    if (!B.keys || n <= 0) return;
+    lin(B.wk, xn_, kraw_, n, xq_);
+    lin(B.wv, xn_, v_, n, xq_);
+    store_f16(kraw_, B.keys, n_kv_ * head_dim_, pos, n, st_);
+    store_f16(v_, B.vals, n_kv_ * head_dim_, pos, n, st_);
+}
+
+// One guess through the block's attention, at pos (the draft block's own rows are all it reads).
+void NemotronHMoe::block_attend(int64_t pos, int n) { attn(blocks_[(size_t) n_layer_], pos, n); }
+
+// The block that guesses ahead must be the one llama.cpp's nemotron-h builds for NextN/MTP.  A file that lacks one of
+// its halves is refused loudly here: before this check the block was loaded as a plain MoE layer and the engine
+// drafted from half a block (silent 0-4% acceptance - P3-20261016\回执\R29-MTP保真度-读码-20261018.md).
+void NemotronHMoe::check_draft_block() {
+    static const char* const kParts[] = {
+        "nextn.eh_proj.weight",   "nextn.enorm.weight",        "nextn.hnorm.weight",
+        "nextn.shared_head_norm.weight", "attn_norm.weight",   "attn_q.weight",
+        "attn_k.weight",          "attn_v.weight",             "attn_output.weight",
+        "post_attention_norm.weight", "ffn_gate_inp.weight",    "exp_probs_b.bias",
+        "ffn_latent_down.weight", "ffn_latent_up.weight"};
+    for (const char* name : kParts)
+        if (!tensor(n_layer_, name))
+            throw std::runtime_error("nemotron_h_moe: the block that guesses ahead (blk." + std::to_string(n_layer_) +
+                                     ") has no " + name + ": this engine runs the NextN/MTP block as an attention" +
+                                     " sub-layer and a MoE sub-layer (llama.cpp nemotron-h.cpp:142-181)");
+    if (blocks_.size() <= (size_t) n_layer_ || blocks_[(size_t) n_layer_].kind != kAttnMoe)
+        throw std::runtime_error("nemotron_h_moe: the block that guesses ahead (blk." + std::to_string(n_layer_) +
+                                 ") is not an attention + MoE block");
 }
 
 void NemotronHMoe::output_rows(int first, int rows, float* h) {

@@ -36,12 +36,18 @@ protected:
     void output_rows(int first, int rows, float* h) override;
     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
     void moe_shared(const Layer& L, int il, int n) override;
+    /// The NextN/MTP block after the model's layers (blk.<n_layer_>): an attention sub-layer and a MoE sub-layer in
+    /// one block (llama.cpp nemotron-h.cpp:142-181), so its machinery is wired here, not in the trunk's layer().
+    void check_draft_block() override;
+    void block_attend(int64_t pos, int n) override;
+    void block_rows(int64_t pos, int n) override;
     const Names* tensor_alias(const char* name) const override;
     const Names* meta_alias(const char* key) const override;
 
 private:
-    /// A layer's kind, from the tensors it has.
-    enum Kind { kMamba, kAttn, kMoe };
+    /// A layer's kind, from the tensors it has.  kAttnMoe is the MTP block alone: the only block with both an
+    /// attention sub-layer and a MoE sub-layer.
+    enum Kind { kMamba, kAttn, kMoe, kAttnMoe };
 
     /// A layer's weights beside the ones every architecture has (Layer), and its places in the state and caches.
     struct Block {

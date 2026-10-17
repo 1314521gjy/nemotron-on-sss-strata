@@ -319,6 +319,7 @@ struct Session {
     // time, which of the two pays.  It and the repeats are the other engine's (strata/spec).
     int most;                             // the tokens of a window at most; 1: no guesses
     bool look;                            // guess from repeats
+    int draft_dump = 0;                   // --draft-dump: print the first this many rounds' guesses vs the picks
     strata::spec::SuffixDrafter repeats;
     strata::spec::DraftPolicy policy;
     Guesses guesses;                      // whether the block is asked in a round, and for how many (guesses.hpp)
@@ -449,6 +450,10 @@ struct Session {
         };
         if (max_new > 0) {
             int32_t w[strata::spec::DraftPolicy::kMaxT], d[strata::spec::DraftPolicy::kMaxT];
+            // --draft-dump: the guesses a round asked for, and the tokens the model picked where they were checked
+            int32_t dump_d[strata::spec::DraftPolicy::kMaxT];
+            int dump_n = 0, dump_round = 0;
+            bool dump_now = false;
             int32_t t = pick(engine.logits());   // picked, and not shown yet
             while (show(t)) {
                 // t goes into the model now, and with it guesses at what follows when there are any that pay
@@ -477,8 +482,22 @@ struct Session {
                         if (!guesses.takes(n_d, p, ms_since(asked_at))) break;
                     }
                     use = policy.choose(1 + n_d, k, match);
+                    if (draft_dump > 0 && dump_round < draft_dump && n_d > 0) {
+                        dump_now = true;
+                        dump_n = n_d;
+                        std::copy(d, d + n_d, dump_d);
+                        std::fprintf(stderr, "draft %d pos=%lld base=%d guess:", dump_round,
+                                     (long long) engine.pos(), t);
+                        for (int j = 0; j < n_d; ++j) std::fprintf(stderr, " %d", dump_d[j]);
+                        std::fprintf(stderr, "\n");
+                    }
                 }
                 if (use.t == 1) {
+                    if (dump_now) {
+                        std::fprintf(stderr, "draft %d picked: (a guess was asked and not used)\n", dump_round);
+                        dump_now = false;
+                        ++dump_round;
+                    }
                     engine.eval(&t, 1, true);
                     kept.read(&t, 1);
                     t = pick(engine.logits());
@@ -498,6 +517,14 @@ struct Session {
                 kept.read(w, right + 1);
                 r.guessed += use.t - 1;
                 r.guessed_right += right + (more ? 0 : 1);
+                if (dump_now) {
+                    std::fprintf(stderr, "draft %d picked:", dump_round);
+                    for (int j = 0; j < right; ++j) std::fprintf(stderr, " %d", w[1 + j]);
+                    if (right < use.t - 1) std::fprintf(stderr, " %d", t);   // where the guess missed
+                    std::fprintf(stderr, " right=%d/%d\n", right, use.t - 1);
+                    dump_now = false;
+                    ++dump_round;
+                }
                 policy.observe(use.lookup, use.t, right, match, count(use.t, right + 1));
                 if (!more) break;
             }
@@ -800,6 +827,8 @@ void usage() {
                  "                         for Gemma 4, its draft model (a gemma4-assistant file)\n"
                  "  --draft-vocab N        the block guesses among the vocabulary's first N tokens (default:\n"
                  "                         131072 for Qwen3.6, Ornith and Tiel, all of it for the others; 0 = all)\n"
+                 "  --draft-dump N         with --tokens: print the first N rounds' guesses against the tokens the\n"
+                 "                         model picked, a line a round (stderr only; nothing else changes; 0 = off)\n"
                  "  --no-graphs            launch a token's kernels one by one (default: a layer's are recorded once\n"
                  "                         as a CUDA graph and replayed)\n"
                  "  --kv-whole             give the attention caches VRAM for the whole context at load (default: as\n"
@@ -918,6 +947,7 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-auto") o.pcie_auto = true;
         else if (a == "--layer-split") o.layer_split = val();
         else if (a == "--draft-vocab") o.draft_vocab = std::atoi(val());
+        else if (a == "--draft-dump") o.draft_dump = std::atoi(val());
         else if (a == "--prompt-batch") o.prompt_batch = std::atoi(val());
         else if (a == "--stage-mib") o.stage_mib = std::atoi(val());
         else if (a == "--stage-ahead") o.stage_ahead = std::atoi(val());
@@ -1021,6 +1051,7 @@ int main(int argc, char** argv) {
                 if (id >= 0 && std::find(eos.begin(), eos.end(), (int32_t) id) == eos.end()) eos.push_back((int32_t) id);
             }
         Session ss(engine, eos, cache, lookup);
+        ss.draft_dump = o.draft_dump;
         int rc = 0;
         if (want_serve) {
             rc = serve(ss);

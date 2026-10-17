@@ -76,6 +76,8 @@ struct Options {
     bool draft = true;            ///< run the block that guesses ahead, when there is one and window is above 1
     int draft_vocab = -1;         ///< the guesses come from the vocabulary's first this many tokens; 0: all of it;
                                   ///< -1: as many as the architecture's vocabulary has in order of use (guess_vocab())
+    int draft_dump = 0;           ///< --draft-dump: print the first this many rounds' guesses against the tokens the
+                                  ///< model picked (stderr, a line a round); only prints, nothing else changes
     std::string draft_model;      ///< a file of the same model to take that block from, when the model's has none;
                                   ///< for an architecture that guesses with a model of its own, that model's file
     int tail_skip = 0;            ///< a routed expert outside VRAM that every token of a call ranks this far down or
