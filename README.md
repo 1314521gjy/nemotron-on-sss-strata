@@ -23,12 +23,27 @@ set STRATA_SWAP_DIRECT_FROM_PIN=1
 set STRATA_PROFILE_AUTO_LEARN=1
 set STRATA_AHEAD_EXACT=1
 
+rem A. 异构 / agent 负载（问答、代码、多轮对话）—— 日常用这套
 sp_seeded.exe --model <gguf> --tokens-file <ids> \
   --max-context 1048576 --prompt-batch 6912 --stage-ahead 128 --stage-mib 2048 \
-  --cpu-share 0.55 --expert-swaps 64 --tail-skip 0 --prompt-cache-every 8192 \
-  --threads 16 --no-draft --lookup 3 --max-new 128 --vram-reserve-mib 3000 \
+  --cpu-share 0.55 --expert-swaps 64 --tail-skip 0 \
+  --threads 16 --no-draft --lookup 0 --max-new 128 --vram-reserve-mib 3000 \
   --expert-profile C:\sp3\p_autolearn.txt
+
+rem B. 模板型负载（重复模板 / 可被 n-gram 命中的续写）—— 只把 --lookup 换掉
+    --lookup 3
 ```
+
+### ⚠️ 两条硬规矩（都是踩出来的）
+
+1. **绝对不要设 `--prompt-cache-every`**：它会按 N 个 token 打"会话检查点"供跨请求复用。
+   我们是 **mamba 混合架构，递归状态无法像纯注意力 KV 那样存取** ⇒ **任何超过该边界的提示、以及之后的请求都会输出崩**
+   （实测：7,306 token 正常 / 11,066 崩 / 去掉后 11,324、12,679、**20,191** 全部正确）。
+   ⇒ 下表基准读数是 **6,792 token（< 8,192）** 上测的，所以当时没暴露；**通用配置一律不设这个旗标**。
+2. **`--lookup` 要按负载选**：模板型 = `3`（n-gram 能抄到，窗口被填满）；异构/agent = `0`（猜不中，白花钱）。
+   异构负载上关掉投机实测 **+9.6%**。
+
+### 基准读数（模板型负载，6,792 token prompt）
 
 | 指标 | 值 | 起点（10-17 末） |
 |---|---|---|
@@ -39,8 +54,8 @@ sp_seeded.exe --model <gguf> --tokens-file <ids> \
 | 显存峰值 | 31,362 MiB（门 31,700） | — |
 | 输出一致性 | ids 与旧基线**逐位相同** | — |
 
-**异构（问答/代码类）prompt：decode ≈18–20 tok/s。** 模板型负载会显著更快——**别把模板数字当通用值**。
-异构负载上**关掉投机**（`--lookup 0`）反而更快（实测 +9.6%），因为 n-gram 在多样文本上猜不中。
+**异构（问答/代码类）prompt：decode ≈18–22 tok/s、prefill ≈1,100–1,400 tok/s**（长提示跨过缓存冷启动后）；
+模板型负载会显著更快——**别把模板数字当通用值**。
 
 ## 2. 关键机制（都默认关，交付脚本显式打开）
 
@@ -134,6 +149,16 @@ copy 交付\p_shipped.txt C:\sp3\p_autolearn.txt
 - **修法**：serve 配置**不要** `--prompt-cache-every`（长提示靠单次 `read()` 读完即可）。
   batch 模式若喂 >N 的长提示同样会中招——交付基准 6,792 < 8,192 才一直没暴露。
 - **验证口径**：必须测"**连续多个长请求**"（第 2、3 条），只测第一条会假绿。
+
+### 6.1b 二号坑：**借槽（`STRATA_PROMPT_BORROW`）在"一次进程跑多个请求"下污染缓存**
+- **症状**：`--serve` 下**第一个请求正常、之后全崩**，输出 `<unk>`(id 0) 连续 256 次（logits 被坏缓存算成 NaN ⇒ argmax 恒 0）；
+  长提示（28K）+ 长输出时最明显。
+- **根因**：借槽把专家缓存**尾部 1,025 个槽**在预填期间借给 staging、预填后再回填。
+  它只适合"**单次跑完就退出**"的 batch 模式（本仓交付基准 decode +11.3% 就在这个模式下测的）；
+  **serve 进程连续处理多个请求时，借出/回填的槽在请求之间不一致** ⇒ 缓存里是错的专家权重。
+- **判据**：同一进程连发 3 个 28K 请求 —— 带 borrow 时输出全 `<unk>`；**去掉 borrow 后 3 个请求全正常**
+  （本机实测：prefill ≈1,200–1,400 tok/s、decode ≈17–18 tok/s、输出语义正确）。
+- **修法**：**serve 配置不要 `STRATA_PROMPT_BORROW`**；batch 单跑交付可保留。
 
 ### 6.2 硬编码形状/静默截断（…"读取尾部不存在"）
 - 同类坑：引擎里可能藏着**写死在参考模型上的常量**（另一条线 `cyber` 的记录：`idx_top_k = 2048` ⇒
