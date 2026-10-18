@@ -21,6 +21,7 @@
 #include <immintrin.h>
 #include <mutex>
 #include <numeric>
+#include <stdexcept>
 
 namespace strata::poly {
 namespace {
@@ -441,6 +442,11 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     bool downT = relu2 != nullptr && td->vec_dot_type == (int) GGML_TYPE_Q8_0 && n_ff == relu2t::kIn &&
                  out_w == relu2t::kOut && relu2->uses == n;
     for (int j = 0; downT && j < n; ++j) downT = experts[j].downT != nullptr;
+    // Stage D: when the caller asked for the T path, never fall back silently to the GGUF row-major down copy
+    // (the sidecar is the only host copy; a fallback would read GGUF down out of the R63 reader table).
+    if (relu2 != nullptr && !downT)
+        throw std::runtime_error("relu2 T down: the live index / downT does not cover this call; refusing the GGUF "
+                                 "down read");
     if (downT) {
         // NOTE: sd is this (the calling) thread's buffer; the workers get a pointer to it, not the thread_local
         // variable - a lambda body that named sd would resolve to each worker's own empty instance (R57 crash 1).

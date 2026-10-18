@@ -1363,26 +1363,34 @@ void Engine::pin_expert_arena() {
     const char* env = std::getenv("STRATA_PIN_ARENA_GIB");
     const double gib = env ? std::atof(env) : 0.0;
     if (gib <= 0) return;
-    // R57c (D0): the pin inventory is UNCHANGED here - the GGUF's up AND down halves are page-locked exactly as the
-    // delivery always had them, so prefill stages both directly.  The down half's pin changes hands later, at the
-    // decode boundary only (relu2_pin_switch(), STRATA_RELU2_DOWN=1).
-    const size_t budget = (size_t) (gib * (double) (size_t(1) << 30));
-    const size_t ram_before = ram_available();
-    // The user's floor: keep every expert in memory.  A full 40-layer pin is 59.06 GiB (40 x 1.4766); with this
-    // box's 76 GiB free, 8 GiB headroom makes it fit where 16 GiB refused it whenever free RAM drifted down.
-    if (ram_before < budget + (size_t(8) << 30)) {
-        std::fprintf(stderr,
-                     "strata-poly: STRATA_PIN_ARENA_GIB=%.1f REFUSED: only %.1f GiB RAM free, needs %.1f + 8 GiB\n",
-                     gib, (double) ram_before / (double) (size_t(1) << 30), gib);
-        return;
-    }
-    // Stage D D4: with the sidecar on, the pin budget is split - this function pins the GGUF up half only, and the
-    // neuron-major sidecar takes the other 29.53 GiB at load (relu2_down_open).  With the switch off: both halves,
-    // exactly as before.
+    // Stage D D4: with the sidecar on, this function pins only the GGUF up half (29.53 GiB); the neuron-major
+    // sidecar takes the other 29.53 GiB at load.  The RAM floor must be the up half's, not the full 59.1: the
+    // budget's "keep every expert in memory" is the two halves taken together, and they are pinned at different
+    // points (sidecar first: relu2_down_open runs before this when the switch is on).
     static const bool r2d_mode = [] {
         const char* e = std::getenv("STRATA_RELU2_DOWN");
         return e != nullptr && std::atoi(e) != 0;
     }();
+    // builder4's precise P1: floor = budget - the segment already pinned elsewhere + 8 GiB.  With the sidecar on,
+    // relu2_down_open() has already pinned r2d_bytes_ (it runs before alloc()), so this pins the up half against the
+    // rest of the budget.  When the sidecar is off / not mapped, r2d_base_ is null and the FULL 59.1 + 8 stays.
+    const size_t budget = (size_t) (gib * (double) (size_t(1) << 30));
+    // builder4 P1: floor = budget - the segment already pinned elsewhere + 8 GiB.  relu2_down_open() runs before
+    // alloc() in r2d mode and has already pinned r2d_bytes_; r2d_base_ null keeps the FULL 59.1 + 8 floor.
+    const size_t already_pinned = r2d_base_ ? r2d_bytes_ : 0;
+    const size_t floor_bytes = budget - already_pinned + (size_t(8) << 30);
+    const size_t ram_before = ram_available();
+    // The user's floor: keep every expert in memory.  A full 40-layer pin is 59.06 GiB (40 x 1.4766); with this
+    // box's 76 GiB free, 8 GiB headroom makes it fit where 16 GiB refused it whenever free RAM drifted down.
+    if (ram_before < floor_bytes) {
+        std::fprintf(stderr,
+                     "strata-poly: STRATA_PIN_ARENA_GIB=%.1f REFUSED: only %.1f GiB RAM free, needs %.1f + 8 GiB\n",
+                     gib, (double) ram_before / (double) (size_t(1) << 30),
+                     (double) (budget - already_pinned) / (double) (size_t(1) << 30));
+        return;
+    }
+    // Stage D D4: with the sidecar on, this function pins the GGUF up half only, and the neuron-major sidecar takes
+    // the other 29.53 GiB at load (relu2_down_open).  With the switch off: both halves, exactly as before.
     pin_layer_.assign(layers_.size(), 0);
     size_t used = 0;
     const Clock::time_point t0 = Clock::now();
@@ -1681,6 +1689,7 @@ void Engine::fill_expert_cache() {
                              "cached=%d exp_at=%zu MiB borrow=%zu MiB\n",
                      free_b >> 20, reserve_mib_, arena >> 20, arena_.mapped >> 20, cached_, exp_at_ >> 20,
                      borrow_bytes_ >> 20);
+    if (r2d_base_) ck(cudaStreamSynchronize(nullptr), "down T sync");   // P2: default stream done before use
 }
 
 // STRATA_PROMPT_BORROW: the region the prompt's staging buffers are lent from the expert cache's tail.  It is a
@@ -2019,6 +2028,7 @@ int Engine::grow_cache(size_t bytes) {
         ++cached_;
     }
     staged_il_ = -1;
+    if (r2d_base_) ck(cudaStreamSynchronize(0), "down T sync");   // D2a on the default stream: finish before use
     held_is_budget();
     return (int) taken.size();
 }
@@ -2355,8 +2365,9 @@ void Engine::load(const Options& o) {
     // of eight.  The layers are counted by now.
     if (opt_.window == 0) opt_.window = recurrent_floats() == 0 || snaps_spread() ? 8 : 4;
     opt_.window = std::min({opt_.window, opt_.prompt_batch, opt_.max_context});
+    // Stage D: the sidecar is pinned and faulted in BEFORE alloc()/pin_expert_arena(), so that pin's floor subtracts it.
+    relu2_down_open();
     alloc();
-    relu2_down_open();   // R56 Stage B: STRATA_RELU2_DOWN=1 maps the neuron-major down sidecar (read only, no pin)
     if (!opt_.profile.empty()) read_profile(opt_.profile, (int) layers_.size(), n_expert_, prior_);
     fill_expert_cache();
     // STRATA_PROMPT_BORROW: the staging buffers the fill lent a region of the cache's tail are pointed at it now:
