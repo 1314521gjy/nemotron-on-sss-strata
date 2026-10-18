@@ -701,6 +701,10 @@ void Engine::relu2_down_open() {
 }
 
 Engine::~Engine() {
+    if (route_dump_) {
+        std::fclose(route_dump_);
+        route_dump_ = nullptr;
+    }
     // R56/R57: the Stage B sidecar mapping (and its option B pin); nothing else points into it.
     if (r2d_base_) {
         if (r2d_pinned_) {
@@ -736,6 +740,7 @@ Engine::~Engine() {
     if (rs_) cudaStreamSynchronize(cs(rs_));
     if (pcie_st_) cudaStreamSynchronize(cs(pcie_st_));   // --pcie-frac: the copies into the staging slots
     if (st_) cudaStreamSynchronize(cs(st_));
+    finish_async_refill();   // STRATA_BORROW_ASYNC_REFILL: no dropped work; its slots become resident, then they go
     workers_.reset();
     mmq_.reset();
     for (void* p : dev_allocs_) cudaFree(p);
@@ -744,7 +749,7 @@ Engine::~Engine() {
     vmm_free(borrow_);   // STRATA_PROMPT_BORROW: the region the prompt's staging buffers were lent
     for (void* p : host_allocs_) cudaFreeHost(p);
     for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_in_[0], ev_in_[1], ev_out_[0], ev_out_[1],
-                    ev_hr_, ev_krn_, ev_copy_, ev_pcie_})
+                    ev_hr_, ev_krn_, ev_copy_, ev_pcie_, ev_refill_})
         if (e) cudaEventDestroy((cudaEvent_t) e);
     for (int s = 0; s < 2; ++s)
         for (void* e : {ev_ring_ahead_[s], ev_ring_free_[s]})
@@ -761,6 +766,7 @@ Engine::~Engine() {
     if (rs_) cudaStreamDestroy(cs(rs_));
     if (pcie_st_) cudaStreamDestroy(cs(pcie_st_));
     if (st_) cudaStreamDestroy(cs(st_));
+    if (as_) cudaStreamDestroy(cs(as_));   // STRATA_BORROW_ASYNC_REFILL: the refill's own stream
 }
 
 void* Engine::dmalloc(size_t bytes, const char* what) {
@@ -1749,6 +1755,7 @@ void Engine::map_prompt_borrow() {
 // refilled there by the answer before go out again first: their slots are the buffers' bytes now.
 void Engine::prompt_borrow_begin() {
     if (!borrow_lend_ || borrow_bytes_ == 0 || prompt_lent_) return;
+    finish_async_refill();   // a refill still pending must be in: the region is about to be the staging buffers
     if (borrow_lent_ > 0) {
         for (const Lent& c : borrow_cands_) {
             Layer& L = layers_[(size_t) c.il];
@@ -1797,6 +1804,10 @@ void Engine::refill_prompt_borrow() {
     }
     std::sort(took.begin(), took.end(),
               [](const Lent& a, const Lent& b) { return a.il != b.il ? a.il < b.il : a.e < b.e; });
+    if (borrow_async_) {   // STRATA_BORROW_ASYNC_REFILL: the copies go on their own stream, the answer starts now
+        start_async_refill(std::move(took));
+        return;
+    }
     size_t at = 0, bytes = 0;
     for (const Lent& c : took) {
         Layer& L = layers_[(size_t) c.il];
@@ -1866,6 +1877,121 @@ void Engine::verify_prompt_borrow(const std::vector<Lent>& took) {
                  refilled_ok, n, control_ok, control);
     if (bad > 0)
         throw std::runtime_error("prompt borrow: a slot does not hold its expert after the refill: the cache is wrong");
+}
+
+// STRATA_BORROW_ASYNC_REFILL: the refill's copies go on a stream of their own.  The slots stay not resident until
+// they land (install_async_refill()), so the answer's first rounds take those experts' CPU path: correct, just
+// slower, and nothing reads a half expert.  coming_ keeps follow() from bringing the same expert in a second time.
+void Engine::start_async_refill(std::vector<Lent> took) {
+    if (as_ == nullptr) {
+        cudaStream_t as = nullptr;
+        ck(cudaStreamCreateWithFlags(&as, cudaStreamNonBlocking), "cudaStreamCreate");
+        as_ = as;
+        cudaEvent_t ev = nullptr;
+        ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+        ev_refill_ = ev;
+    }
+    ck(cudaMemsetAsync((void*) borrow_.base, 0, borrow_bytes_, cs(as_)), "the borrowed prompt buffers");
+    const size_t ne = (size_t) n_expert_;
+    size_t at = 0;
+    for (const Lent& c : took) {
+        Layer& L = layers_[(size_t) c.il];
+        uint8_t* const s = (uint8_t*) borrow_.base + at;
+        at += c.bytes;
+        const size_t e = (size_t) c.e;
+        if (L.gated)
+            ck(cudaMemcpyAsync(s, L.exp_gate + e * L.gu_stride, L.gu_bytes, cudaMemcpyHostToDevice, cs(as_)),
+               "expert refill");
+        ck(cudaMemcpyAsync(s + L.slot_up(), L.exp_up + e * L.gu_stride, L.gu_bytes, cudaMemcpyHostToDevice, cs(as_)),
+           "expert refill");
+        if (r2d_base_)
+            materialize_down(L, (int) (&L - layers_.data()), e, s + L.slot_down(), cs(as_));
+        else
+            ck(cudaMemcpyAsync(s + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice,
+                               cs(as_)),
+               "expert refill");
+        if (!coming_.empty()) coming_[(size_t) c.il * ne + e] = 1;   // follow() must not bring it in too
+    }
+    ck(cudaEventRecord((cudaEvent_t) ev_refill_, cs(as_)), "expert refill");
+    async_took_ = std::move(took);
+    async_refill_ = true;
+    async_pos0_ = pos_;
+    async_miss0_ = stats_.cpu_experts;   // the pending window's misses: its experts take the CPU path until they land
+    async_tok0_ = stats_.tokens;
+    async_t0_s_ = std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+    std::fprintf(stderr, "borrow: async refill started, %zu slots pending (their experts take the CPU path until "
+                         "they land)\n", async_took_.size());
+}
+
+// The copies have landed: the experts become resident (their slots, the cache's count) so the rounds after this one
+// see them.  The time and the tokens that ran while they were in flight are the self-check line.
+void Engine::install_async_refill() {
+    const size_t ne = (size_t) n_expert_;
+    size_t at = 0, bytes = 0;
+    for (const Lent& c : async_took_) {
+        Layer& L = layers_[(size_t) c.il];
+        const size_t e = (size_t) c.e;
+        L.slot[e] = (uint8_t*) borrow_.base + at;
+        at += c.bytes;
+        bytes += c.bytes;
+        if (!coming_.empty()) coming_[(size_t) c.il * ne + e] = 0;
+        ++cached_;
+    }
+    borrow_refill_bytes_ = bytes;
+    borrow_lent_ = (int) async_took_.size();
+    borrow_refill_ms_ =
+        (std::chrono::duration<double>(Clock::now().time_since_epoch()).count() - async_t0_s_) * 1000.0;
+    // The self-check must let a reader take this window's decode apart: the pending slots' experts go the CPU path,
+    // so their window has more misses than the answer's later one - the count is printed, not left to be guessed.
+    const int64_t d_miss = stats_.cpu_experts - async_miss0_, d_tok = stats_.tokens - async_tok0_;
+    std::fprintf(stderr,
+                 "borrow: async refill done in %.1f ms (overlapped with %lld tokens; %zu slots pending, +%lld CPU "
+                 "misses = %.2f/token over the window)\n",
+                 borrow_refill_ms_, (long long) (pos_ - async_pos0_), async_took_.size(), (long long) d_miss,
+                 d_tok > 0 ? (double) d_miss / (double) d_tok : 0.0);
+    if (borrow_verify_ > 0) verify_prompt_borrow(async_took_);
+    async_took_.clear();
+    async_refill_ = false;
+}
+
+// run()'s start: when the refill's event says its copies are in, the slots become resident before this call's layers
+// look at the cache.  A failure is loud and leaves those experts on the CPU path for good (never half data).
+void Engine::poll_async_refill() {
+    if (!async_refill_) return;
+    const cudaError_t st = cudaEventQuery((cudaEvent_t) ev_refill_);
+    if (st == cudaErrorNotReady) return;
+    if (st != cudaSuccess) {
+        cudaGetLastError();
+        const size_t lost = async_took_.size();
+        for (const Lent& c : async_took_)
+            if (!coming_.empty()) coming_[(size_t) c.il * (size_t) n_expert_ + (size_t) c.e] = 0;
+        async_took_.clear();
+        async_refill_ = false;
+        std::fprintf(stderr, "borrow: async refill FAILED (%s): %zu slots stay not resident, their experts take the "
+                             "CPU path\n", cudaGetErrorString(st), lost);
+        return;
+    }
+    install_async_refill();
+}
+
+// The answer is over (or another prompt is about to use the region): the refill must be done and its slots installed
+// before the region is touched again - its work is never dropped.
+void Engine::finish_async_refill() {
+    if (!async_refill_) return;
+    const cudaError_t st = cudaStreamSynchronize(cs(as_));
+    if (st != cudaSuccess) {
+        cudaGetLastError();
+        std::fprintf(stderr, "borrow: async refill did not finish (%s); its %zu slots stay not resident\n",
+                     cudaGetErrorString(st), async_took_.size());
+        for (const Lent& c : async_took_)
+            if (!coming_.empty()) coming_[(size_t) c.il * (size_t) n_expert_ + (size_t) c.e] = 0;
+        async_took_.clear();
+        async_refill_ = false;
+        return;
+    }
+    std::fprintf(stderr, "borrow: async refill finished at the answer's end (%zu slots pending installed)\n",
+                 async_took_.size());
+    install_async_refill();
 }
 
 // The thread and the stream that bring experts into the cache while an answer is written (follow()).
@@ -2297,6 +2423,20 @@ void Engine::load(const Options& o) {
                      "tail%s\n",
                      !borrow_lend_ ? "; STRATA_PROMPT_BORROW_SLOTS=0, none lent: they hold their own VRAM"
                      : borrow_refill_ ? "" : "; STRATA_PROMPT_BORROW_REFILL=0, nothing is put back");
+    // STRATA_BORROW_ASYNC_REFILL: the refill runs on a stream of its own while the answer's first rounds run; off
+    // (the refill blocks the prompt's end), the default.  The switch says what it did.
+    borrow_async_ = [] {
+        const char* e = std::getenv("STRATA_BORROW_ASYNC_REFILL");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    if (borrow_async_ && (!borrow_lend_ || !borrow_refill_)) {
+        borrow_async_ = false;
+        std::fprintf(stderr, "strata-poly: STRATA_BORROW_ASYNC_REFILL=1 needs STRATA_PROMPT_BORROW=1 with a lend and "
+                             "the refill on: the switch stays off\n");
+    } else if (borrow_async_) {
+        std::fprintf(stderr, "strata-poly: STRATA_BORROW_ASYNC_REFILL=1: the refill runs on a stream of its own while "
+                             "the answer's first rounds run; its experts take the CPU path until they land\n");
+    }
     // STRATA_CUT_HANDOFF: the per-layer handoff cuts (C1: a layer's routed-experts sum and latent projection are
     // recorded once and replayed with one call; C3: a few rows' activation conversion runs on the calling thread
     // instead of a worker pass).  Off by default - the delivery default is the old path byte for byte; =1 turns
@@ -2852,6 +2992,11 @@ void Engine::alloc() {
     if (const char* pdo = std::getenv("STRATA_PROFILE_DECODE_ONLY"); pdo && pdo[0] == '1' && pdo[1] == '\0')
         std::fprintf(stderr, "strata-poly: STRATA_PROFILE_DECODE_ONLY=1: the expert profile is built from the "
                             "answer's routing only\n");
+    if (const char* dr = std::getenv("STRATA_DUMP_ROUTE"); dr && dr[0] == '1' && dr[1] == '\0') {
+        route_dump_ = std::fopen("C:\\sp3\\route_dump.txt", "w");
+        if (!route_dump_) throw std::runtime_error("STRATA_DUMP_ROUTE: cannot open C:\\sp3\\route_dump.txt");
+        std::fprintf(stderr, "strata-poly: STRATA_DUMP_ROUTE=1: routing dumped to C:\\sp3\\route_dump.txt\n");
+    }
 }
 
 void Engine::save_profile() const {
@@ -3047,6 +3192,13 @@ void Engine::lin(const Dev& w, const float* x, float* y, int n, const void* xq, 
                              y + (size_t) at * w.n_out, w.n_in, w.n_out, std::min(8, n - at), st_);
 }
 
+// STRATA_DUMP_ROUTE=1 only (default 0: never called).
+void Engine::dump_route(const int* ids, int il, int32_t token) {
+    std::fprintf(route_dump_, "%d %d", il, (int) token);
+    for (int k = 0; k < n_used_; ++k) std::fprintf(route_dump_, " %d", ids[k]);
+    std::fputc('\n', route_dump_);
+}
+
 void Engine::router_scores(const Layer& L, int n) { lin(L.gate_inp, xn_, rl_, n, xq_); }
 
 bool Engine::batched(const Layer& L, int n) const { return mmq_ && L.mmq && n >= kStageRows; }
@@ -3105,6 +3257,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             int ids[kMaxUsed];
             float w[kMaxUsed];
             route(il, h_rl_ + (size_t) (at + t) * n_expert_, tok_ ? tok_[at + t] : -1, ids, w, route_tmp_.data());
+            if (route_dump_) dump_route(ids, il, (int32_t) (pos_ + at + t));
             for (int k = 0; k < n_used_; ++k) {
                 const size_t e = (size_t) ids[k];
                 ++use_[(size_t) il * n_expert_ + e];
@@ -3701,9 +3854,11 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     if (parts > 0) workers_->run(parts, [&](int p) {
         float* tmp = route_tmp_.data() + (size_t) p * 2 * n_expert_;
         const int end = (int) ((int64_t) n * (p + 1) / parts);
-        for (int t = (int) ((int64_t) n * p / parts); t < end; ++t)
+        for (int t = (int) ((int64_t) n * p / parts); t < end; ++t) {
             route(il, h_rl_ + (size_t) t * n_expert_, tok_ ? tok_[t] : -1, ids_.data() + (size_t) t * n_used_,
                   w + (size_t) t * n_used_, tmp);
+            if (route_dump_) dump_route(ids_.data() + (size_t) t * n_used_, il, (int32_t) (pos_ + t));
+        }
     });
     count_.assign((size_t) n_expert_, 0);
     for (int i = 0; i < rr; ++i) {
@@ -4188,6 +4343,7 @@ void Engine::run(const int32_t* tokens, int n) {
     if (n < 1 || n > rows_) throw std::logic_error("eval takes 1 to max_rows() tokens");
     if (pos_ + n > opt_.max_context)
         throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
+    poll_async_refill();   // STRATA_BORROW_ASYNC_REFILL: the slots whose copies have landed become resident
     cover(pos_ + n);
 
     // h_r_ and h_cpu_ may still be the source of the previous call's copies

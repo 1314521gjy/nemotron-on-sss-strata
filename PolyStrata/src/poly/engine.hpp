@@ -756,6 +756,23 @@ protected:
     void map_prompt_borrow();           ///< fill_expert_cache(): maps the region and checks it fits (loud)
     void refill_prompt_borrow();        ///< prompt_borrow_end(): the experts back into the region, verified
     void verify_prompt_borrow(const std::vector<Lent>& took);   ///< STRATA_PROMPT_BORROW_CHECK
+    // STRATA_BORROW_ASYNC_REFILL: the refill runs on a stream of its own while the answer's first rounds run.  The
+    // experts it is filling in are not resident until their copies land (their slot pointers and the cache's count
+    // are set then), so a token that routes to one takes the CPU path - correct, just slower - and nothing ever
+    // reads half an expert.  Off by default: the refill blocks the prompt's end as it always did.
+    bool borrow_async_ = false;        ///< STRATA_BORROW_ASYNC_REFILL=1
+    bool async_refill_ = false;        ///< a refill is in flight: async_took_ is not resident yet
+    void* as_ = nullptr;               ///< its stream (made the first time one is needed)
+    void* ev_refill_ = nullptr;        ///< marks its last copy
+    double async_t0_s_ = 0.0;          ///< steady_clock seconds when it started, for the done line
+    int64_t async_pos0_ = 0;           ///< the sequence position the answer had when it started
+    int64_t async_miss0_ = 0;          ///< stats_.cpu_experts when it started (the pending window's misses)
+    int64_t async_tok0_ = 0;           ///< stats_.tokens when it started (the pending window's tokens)
+    std::vector<Lent> async_took_;     ///< the experts it is filling in, in the region's order
+    void start_async_refill(std::vector<Lent> took);   ///< prompt_borrow_end(): the copies go on as_
+    void install_async_refill();       ///< they have landed: the slots become resident (and counted)
+    void poll_async_refill();          ///< run()'s start: installs them once the event says they are in
+    void finish_async_refill();        ///< prompt_borrow_begin()/~Engine: wait for them, then install
     // --pcie-frac (Compile #1 skeleton, Compile #2 the split): the staging slots a share of an answer's misses are
     // copied into, and the stream and event that take them there.  Null and unallocated unless the switch is above
     // 0, so the default run's VRAM, expert cache and arithmetic are exactly as before.
@@ -858,6 +875,10 @@ protected:
     // table was built from).  use_ still counts both, so everything that orders or moves the cache reads exactly
     // what it always did; only save_profile() picks a side.
     std::vector<int64_t> use_decode_, use_prefill_;
+    // STRATA_DUMP_ROUTE=1: one line a routed (layer, token): "il token id0 .. id21", for the offline 1.6/1.7
+    // accuracy gate.  Default 0: no file, no writes, the routed path byte for byte unchanged.
+    FILE* route_dump_ = nullptr;
+    void dump_route(const int* ids, int il, int32_t token);
     Stats stats_;
 };
 

@@ -331,6 +331,17 @@ struct Session {
     // time, which of the two pays.  It and the repeats are the other engine's (strata/spec).
     int most;                             // the tokens of a window at most; 1: no guesses
     bool look;                            // guess from repeats
+    // STRATA_LOOKUP_CHAIN=1: a prompt-lookup (suffix) window is chained after the MTP's own first guess - only
+    // where that guess is what the lookup proposes first (the upstream agreement gate) and the draft policy still
+    // keeps a window, and only up to the window's hard top (kBlockWindow).  Off by default: the release path is
+    // byte for byte the one it was.  Mirrors E:\strata\src\program\generate.cpp:3267-3277 (the MTP-first-guess
+    // agreement gate before the policy may take the lookup window).
+    bool chain = false;
+    int64_t chain_rounds = 0, chain_tokens = 0;   // its self-check: rounds it fired in, tokens they chained
+    static bool chain_on() {
+        const char* e = std::getenv("STRATA_LOOKUP_CHAIN");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }
     int draft_dump = 0;                   // --draft-dump: print the first this many rounds' guesses vs the picks
     // R49: the answer's round ledger (rounds, offered/accepted drafts, the windows' T histogram), printed with the
     // four clocks at the end of an answer.
@@ -343,8 +354,12 @@ struct Session {
     Session(Engine& e, std::vector<int32_t> eos_ids, const CacheFlags& f, int lookup)
         : engine(e), eos(std::move(eos_ids)), flags(f), kept(e, with_floor(f)),
           most(lookup > 0 || e.drafts() ? std::min<int>(e.max_window(), strata::spec::DraftPolicy::kMaxT) : 1),
-          look(lookup > 0 && most > 1),
+          look((lookup > 0 || chain_on()) && most > 1),
+          chain(chain_on()),
           repeats(std::max(lookup, 3), 64, (size_t) e.max_context() + 4096), policy(most) {
+        if (chain && most > 1)
+            std::fprintf(stderr, "strata-poly: STRATA_LOOKUP_CHAIN=1: a lookup window is chained after the MTP's "
+                                 "first guess (agreement + policy gated, window <= %d)\n", kBlockWindow);
         // STRATA_DET_WINDOW=1: Guesses fixes the window's depth instead of measuring it; this is the line the
         // receipts use to prove the mode ran.
         const char* dw = std::getenv("STRATA_DET_WINDOW");
@@ -529,6 +544,7 @@ struct Session {
                 };
                 strata::spec::DraftPolicy::Pick use = policy.choose(1, k, match);
                 int round_drafts = 0;   // R49: the round's asked guesses, for the ledger
+                bool chained = false;   // STRATA_LOOKUP_CHAIN: this round's window is the lookup chained after d[0]
                 if (ask) {
                     int n_d = 0;
                     for (int32_t from = t; n_d < std::min(most, kBlockWindow) - 1 && guesses.wants(n_d); from = d[n_d++]) {
@@ -539,9 +555,33 @@ struct Session {
                     }
                     round_drafts = n_d;
                     use = policy.choose(1 + n_d, k, match);
+                    // STRATA_LOOKUP_CHAIN isolates the chain: a pure lookup window is not taken here (the block's
+                    // window is), so a tokens/round rise is the chain's and not the suffix drafter's own window.
+                    if (chain && use.lookup) {
+                        use.lookup = false;
+                        use.t = 1 + n_d;
+                    }
                     if (guesses.deterministic()) {   // fixed depth: use every guess the chain produced
                         use.t = 1 + n_d;
                         use.lookup = false;
+                    }
+                    // STRATA_LOOKUP_CHAIN: the lookup proposal was written at w + 1 before the block was asked.
+                    // Where the block's own first guess is what the lookup proposes first (the upstream gate), the
+                    // lookup's continuation is chained onto it, up to the window top, while the policy keeps a
+                    // window: the window becomes [t, lookup[0], lookup[1], ...] - no MTP draft past the first.
+                    if (chain && !guesses.deterministic() && n_d >= 1 && !use.lookup && use.t >= 2 && offered >= 2 &&
+                        w[1] == d[0]) {
+                        const int t_chain = std::min({most, kBlockWindow, offered + 1});
+                        if (t_chain > use.t) {
+                            use.t = t_chain;
+                            use.lookup = false;
+                            chained = true;
+                            ++chain_rounds;
+                            chain_tokens += t_chain - 1;
+                            round_drafts = t_chain - 1;   // the window's drafts are what is verified, not the MTP's
+                            std::fprintf(stderr, "lookup-chain: chained %d tokens after MTP's first guess (window %d)\n",
+                                         t_chain - 1, t_chain);
+                        }
                     }
                     if (draft_dump > 0 && dump_round < draft_dump && n_d > 0) {
                         dump_now = true;
@@ -552,6 +592,13 @@ struct Session {
                         for (int j = 0; j < n_d; ++j) std::fprintf(stderr, " %d", dump_d[j]);
                         std::fprintf(stderr, "\n");
                     }
+                }
+                // STRATA_LOOKUP_CHAIN: a round that did not ask the block takes no pure lookup window either - the
+                // run is the MTP's round or the chain's, so tokens/round isolates the chain (the off run does this
+                // too: with --lookup 0 there is no proposal at all).
+                if (chain && !ask && use.lookup) {
+                    use.lookup = false;
+                    use.t = 1;
                 }
                 ++dec_rounds;
                 dec_offered += round_drafts;
@@ -570,7 +617,7 @@ struct Session {
                     continue;
                 }
                 w[0] = t;
-                if (!use.lookup) std::copy(d, d + use.t - 1, w + 1);
+                if (!use.lookup && !chained) std::copy(d, d + use.t - 1, w + 1);
                 engine.window(w, use.t);
                 // logits_of(i) is what follows w[i].  A guess that is what was picked has been through the model
                 // already; the token an answer ends with is shown and never fed, as without guesses.
@@ -910,6 +957,9 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
                      ss.dec_rounds ? wall / (double) ss.dec_rounds : 0.0,
                      ss.dec_rounds ? (double) (st.tokens - ss.at_decode_tokens) / (double) ss.dec_rounds : 0.0, hist,
                      d_miss > 0 ? 1000.0 * (st.pcie_wait_ms - ss.at_decode_pcie_wait_ms) / (double) d_miss : 0.0);
+        if (ss.chain_rounds > 0)
+            std::fprintf(stderr, "lookup-chain: answer summary: fired in %lld rounds, chained %lld tokens\n",
+                         (long long) ss.chain_rounds, (long long) ss.chain_tokens);
         // R51: the two segments measured directly beside the derived ones, the pool closure, and the probe line.
         const double host_m = st.launch_ms - ss.at_decode_launch_ms;
         const double commit_m = st.commit_ms - ss.at_decode_commit_ms;
