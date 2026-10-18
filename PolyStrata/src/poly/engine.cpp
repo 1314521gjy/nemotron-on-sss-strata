@@ -2817,20 +2817,38 @@ void Engine::alloc() {
         rs_ = rs;
     }
     use_.assign(layers_.size() * n_expert_, 0);
+    use_decode_.assign(use_.size(), 0);    // STRATA_PROFILE_DECODE_ONLY: the answer's and the prompt's, apart
+    use_prefill_.assign(use_.size(), 0);
+    if (const char* pdo = std::getenv("STRATA_PROFILE_DECODE_ONLY"); pdo && pdo[0] == '1' && pdo[1] == '\0')
+        std::fprintf(stderr, "strata-poly: STRATA_PROFILE_DECODE_ONLY=1: the expert profile is built from the "
+                            "answer's routing only\n");
 }
 
 void Engine::save_profile() const {
     if (opt_.profile.empty()) return;
     if (!opt_.profile_write) return;   // DEFAULT READ-ONLY: only --expert-profile-write writes it back
+    // STRATA_PROFILE_DECODE_ONLY=1: the table is the answer's counts alone (the prompt's were 98.26% of every count
+    // the table was built from and did not match the decode distribution).  Off (the default): the counts are the
+    // ones it always wrote - the two sides added - so the release path is byte for byte the one it was.
+    static const bool decode_only = [] {
+        const char* e = std::getenv("STRATA_PROFILE_DECODE_ONLY");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
     const std::string tmp = opt_.profile + ".tmp";
     // every card's engine counts its own layers' experts, and the last one's profile has the draft block's too
     const Engine* last = this;
     while (last->next_) last = last->next_.get();
     std::vector<int64_t> all = last->prior_;
+    unsigned long long dec = 0, pre = 0;
     for (const Engine* e = this; e; e = e->next_.get()) {
-        if (all.size() < e->use_.size()) all.resize(e->use_.size(), 0);
-        for (size_t i = 0; i < e->use_.size(); ++i) all[i] += e->use_[i];
+        const std::vector<int64_t>& counts = decode_only ? e->use_decode_ : e->use_;
+        if (all.size() < counts.size()) all.resize(counts.size(), 0);
+        for (size_t i = 0; i < counts.size(); ++i) all[i] += counts[i];
+        for (const int64_t c : e->use_decode_) dec += (unsigned long long) c;
+        for (const int64_t c : e->use_prefill_) pre += (unsigned long long) c;
     }
+    if (decode_only)   // the two totals: a run shows the split the table was built from
+        std::fprintf(stderr, "strata-poly: profile: decode-only counts (decode=%llu prefill=%llu)\n", dec, pre);
     FILE* f = std::fopen(tmp.c_str(), "w");
     if (!f) throw std::runtime_error("cannot write " + tmp);
     long long saved = 0;
@@ -3060,6 +3078,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             for (int k = 0; k < n_used_; ++k) {
                 const size_t e = (size_t) ids[k];
                 ++use_[(size_t) il * n_expert_ + e];
+                ++use_decode_[(size_t) il * n_expert_ + e];   // STRATA_PROFILE_DECODE_ONLY: the answer's counts
                 if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += 1.f;
                 if (const uint8_t* s = L.slot[e]) {
                     cached[n_cached++] = {s, w[k], at + t};
@@ -3660,6 +3679,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     for (int i = 0; i < rr; ++i) {
         ++count_[(size_t) ids_[(size_t) i]];
         ++use_[(size_t) il * n_expert_ + (size_t) ids_[(size_t) i]];
+        ++use_prefill_[(size_t) il * n_expert_ + (size_t) ids_[(size_t) i]];   // and the prompt's, apart
     }
     // The CPU computes some of the routed experts outside VRAM while the others are copied: the ones the fewest
     // tokens chose, whose copy costs as much as any other's and which cost the CPU about as much as their tokens.

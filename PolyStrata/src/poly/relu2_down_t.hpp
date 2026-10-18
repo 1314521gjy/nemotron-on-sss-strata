@@ -92,11 +92,20 @@ inline void down_chunk(const uint8_t* T, const uint8_t* hq, const int32_t* live,
 
     int li = 0;
     for (int k = 0; k < kBlocks; ++k) {
+        // prefetch this block's scale row (128 B) early: the scales are read after the neuron loop
+        _mm_prefetch((const char*) (scales + (size_t) k * kGroupBytes + (size_t) r0 * 2), _MM_HINT_T0);
+        _mm_prefetch((const char*) (scales + (size_t) k * kGroupBytes + (size_t) r0 * 2 + 64), _MM_HINT_T0);
         // this block's eight int32 lane sums, lane-major over the chunk's 64 rows
         alignas(32) int32_t p[8][kChunk];
         std::memset(p, 0, sizeof p);
         while (li < n_live && (live[li] >> 5) < k) ++li;
+        // R2 (R65 §2b: the T kernel is latency-bound, 4.9 GB/s): 512 B-strided neuron lines cannot be followed by
+        // the hardware prefetcher, so issue the next neurons' lines by hand.  Prefetch only: no arithmetic change.
+        for (int q = li; q < n_live && q < li + 4 && (live[q] >> 5) == k; ++q)
+            _mm_prefetch((const char*) (T + (size_t) live[q] * kNeuronBytes + (size_t) (r0 >> 1)), _MM_HINT_T0);
         for (int q = li; q < n_live && (live[q] >> 5) == k; ++q) {
+            for (int qa = q + 1; qa <= q + 3 && qa < n_live && (live[qa] >> 5) == k; ++qa)
+                _mm_prefetch((const char*) (T + (size_t) live[qa] * kNeuronBytes + (size_t) (r0 >> 1)), _MM_HINT_T0);
             const int n = live[q];
             const int lane = (n & 31) >> 2;
             const int8_t hv = (int8_t) hq[(size_t) k * kQ8BlockBytes + 2 + (n & 31)];

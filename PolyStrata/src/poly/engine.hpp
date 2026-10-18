@@ -853,6 +853,11 @@ protected:
     std::vector<Image> images_;          ///< the sequence's pictures, by row
     uint64_t images_set_ = 0;            ///< counts images(): what was derived from an earlier list is stale
     std::vector<int64_t> use_, prior_;   ///< routed count per (layer, expert): this run, and the profile's
+    // STRATA_PROFILE_DECODE_ONLY: the routed uses of the answer's tokens and of the prompt's, counted apart - the
+    // profile can then be written from the decode routing alone (the prompt path was 98.26% of every count the
+    // table was built from).  use_ still counts both, so everything that orders or moves the cache reads exactly
+    // what it always did; only save_profile() picks a side.
+    std::vector<int64_t> use_decode_, use_prefill_;
     Stats stats_;
 };
 
