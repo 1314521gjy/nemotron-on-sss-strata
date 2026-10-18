@@ -23,12 +23,27 @@ set STRATA_SWAP_DIRECT_FROM_PIN=1
 set STRATA_PROFILE_AUTO_LEARN=1
 set STRATA_AHEAD_EXACT=1
 
+rem A. 异构 / agent 负载（问答、代码、多轮对话）—— 日常用这套
 sp_seeded.exe --model <gguf> --tokens-file <ids> \
   --max-context 1048576 --prompt-batch 6912 --stage-ahead 128 --stage-mib 2048 \
-  --cpu-share 0.55 --expert-swaps 64 --tail-skip 0 --prompt-cache-every 8192 \
-  --threads 16 --no-draft --lookup 3 --max-new 128 --vram-reserve-mib 3000 \
+  --cpu-share 0.55 --expert-swaps 64 --tail-skip 0 \
+  --threads 16 --no-draft --lookup 0 --max-new 128 --vram-reserve-mib 3000 \
   --expert-profile C:\sp3\p_autolearn.txt
+
+rem B. 模板型负载（重复模板 / 可被 n-gram 命中的续写）—— 只把 --lookup 换掉
+    --lookup 3
 ```
+
+### ⚠️ 两条硬规矩（都是踩出来的）
+
+1. **绝对不要设 `--prompt-cache-every`**：它会按 N 个 token 打"会话检查点"供跨请求复用。
+   我们是 **mamba 混合架构，递归状态无法像纯注意力 KV 那样存取** ⇒ **任何超过该边界的提示、以及之后的请求都会输出崩**
+   （实测：7,306 token 正常 / 11,066 崩 / 去掉后 11,324、12,679、**20,191** 全部正确）。
+   ⇒ 下表基准读数是 **6,792 token（< 8,192）** 上测的，所以当时没暴露；**通用配置一律不设这个旗标**。
+2. **`--lookup` 要按负载选**：模板型 = `3`（n-gram 能抄到，窗口被填满）；异构/agent = `0`（猜不中，白花钱）。
+   异构负载上关掉投机实测 **+9.6%**。
+
+### 基准读数（模板型负载，6,792 token prompt）
 
 | 指标 | 值 | 起点（10-17 末） |
 |---|---|---|
@@ -39,8 +54,8 @@ sp_seeded.exe --model <gguf> --tokens-file <ids> \
 | 显存峰值 | 31,362 MiB（门 31,700） | — |
 | 输出一致性 | ids 与旧基线**逐位相同** | — |
 
-**异构（问答/代码类）prompt：decode ≈18–20 tok/s。** 模板型负载会显著更快——**别把模板数字当通用值**。
-异构负载上**关掉投机**（`--lookup 0`）反而更快（实测 +9.6%），因为 n-gram 在多样文本上猜不中。
+**异构（问答/代码类）prompt：decode ≈18–22 tok/s、prefill ≈1,100–1,400 tok/s**（长提示跨过缓存冷启动后）；
+模板型负载会显著更快——**别把模板数字当通用值**。
 
 ## 2. 关键机制（都默认关，交付脚本显式打开）
 
