@@ -2726,6 +2726,100 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
     small_f32<IQ4NLBlock, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+// ===================== Stage D: the neuron-major ("T") IQ4_NL down kernel =====================
+// Bitwise the same value as small_mmvq<IQ4NLBlock,4> on the row-major bytes (R58 parity: 3 activation cases x 2 real
+// experts x 1024 rows, memcmp 0).  It is that kernel's thread mapping, block split between two lanes, block order,
+// float d and warp tree; only the weight nibbles and block scales are read from the sidecar's T block instead.
+__global__ void native_iq4_nl_mmvq_T_kernel(const uint8_t* __restrict__ T, const Q81Block* __restrict__ x,
+                                            float* __restrict__ y, int n_in, int n_out) {
+    const int row = int(blockIdx.x);
+    if (row >= n_out) return;
+    const int n_blocks = n_in / 32;
+    const size_t neuron_bytes = (size_t) (n_out / 2);
+    const size_t scales_at = (size_t) n_in * neuron_bytes;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    float tmp = 0.f;
+    const int half_sel = tid & 1;   // which half of a block's 32 values this lane dots (kqs = 2*(tid%2) in the row kernel)
+    for (int kbx = tid / 2; kbx < n_blocks; kbx += 2 * WARPS * WARP / 4) {
+        const Q81Block& xb = x[kbx];
+        int sumi = 0;   // the row kernel's int32 dot of this lane's 16 values (order-free)
+        for (int v = 0; v < 32; ++v) {
+            if (((v >> 3) & 1) != half_sel) continue;
+            const int n = kbx * 32 + v;
+            const uint8_t byte = T[(size_t) n * neuron_bytes + (size_t) (row >> 1)];
+            const int nib = (row & 1) ? (byte >> 4) : (byte & 15);
+            sumi += (int) iq4nl_values[nib] * (int) xb.qs[v];
+        }
+        const uint8_t* sc = T + scales_at + (size_t) kbx * (size_t) (n_out * 2) + (size_t) row * 2;
+        __half h;
+        memcpy(&h, sc, sizeof h);
+        const float d = __half2float(h) * __low2float(xb.ds);
+        tmp += d * float(sumi);
+    }
+    __shared__ float partial[WARPS - 1][WARP];
+    if (threadIdx.y > 0) partial[threadIdx.y - 1][threadIdx.x] = tmp;
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+    for (int l = 0; l < WARPS - 1; ++l) tmp += partial[l][threadIdx.x];
+    tmp = warp_sum(tmp);
+    if (threadIdx.x == 0) y[row] = tmp;
+}
+
+void native_iq4_nl_mmvq_T(const void* T, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                          void* stream) {
+    if (ncols != 1) throw std::invalid_argument("native_iq4_nl_mmvq_T: ncols must be 1");
+    if (n_in != 2688 || n_out != 1024)
+        throw std::invalid_argument("native_iq4_nl_mmvq_T: only the packed 2688-neuron, 1024-row expert shape");
+    validate_pointer(T);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const dim3 threads(WARP, WARPS);
+    native_iq4_nl_mmvq_T_kernel<<<unsigned(n_out), threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint8_t*>(T), static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out);
+    launch_check();
+}
+
+bool native_mmvq_slots_T(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream) {
+    if (ggml_type != 20) return false;   // GGML_TYPE_IQ4_NL (this file keeps the type ids as ints)
+    if (count <= 0) return true;
+    for (int j = 0; j < count && j < 8; ++j)
+        native_iq4_nl_mmvq_T(slots.w[j], slots.x[j], slots.y[j], n_in, n_out, 1, stream);
+    return true;
+}
+
+// ===================== Stage D D2a: neuron-major T -> row-major bytes, on the device =====================
+__global__ void native_relu2_t_to_row_kernel(const uint8_t* __restrict__ T, uint8_t* __restrict__ R) {
+    constexpr int kIn = 2688, kOut = 1024, kBlocks = kIn / 32, kRowB = kBlocks * 18;   // 1512
+    constexpr size_t kValuesB = (size_t) kIn * (kOut / 2);                             // 1,376,256
+    for (int i = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x); i < kBlocks * kOut * 2;
+         i += int(gridDim.x) * int(blockDim.x)) {
+        const int g = i / (kOut * 2), rem = i % (kOut * 2), r = rem / 2, bb = rem % 2;
+        R[(size_t) r * kRowB + (size_t) g * 18 + bb] = T[kValuesB + (size_t) g * (kOut * 2) + (size_t) r * 2 + bb];
+    }
+    for (int i = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x); i < kOut * kBlocks * 16;
+         i += int(gridDim.x) * int(blockDim.x)) {
+        const int r = i / (kBlocks * 16), rem = i % (kBlocks * 16), k = rem / 16, j = rem % 16;
+        const int n0 = k * 32 + j, n1 = k * 32 + j + 16;
+        const uint8_t b0 = T[(size_t) n0 * (kOut / 2) + (size_t) (r >> 1)];
+        const uint8_t b1 = T[(size_t) n1 * (kOut / 2) + (size_t) (r >> 1)];
+        const bool odd = (r & 1) != 0;
+        const int v0 = odd ? (b0 >> 4) : (b0 & 15);
+        const int v1 = odd ? (b1 >> 4) : (b1 & 15);
+        R[(size_t) r * kRowB + (size_t) k * 18 + 2 + j] = (uint8_t) (v0 | (v1 << 4));
+    }
+}
+
+void native_relu2_t_to_row(const void* T, void* row, int n_in, int n_out, void* stream) {
+    if (n_in != 2688 || n_out != 1024)
+        throw std::invalid_argument("native_relu2_t_to_row: only the packed 2688-neuron, 1024-row expert shape");
+    validate_pointer(T);
+    validate_pointer(row);
+    native_relu2_t_to_row_kernel<<<256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint8_t*>(T), static_cast<uint8_t*>(row));
+    launch_check();
+}
+
 bool native_mmvq_supported(int ggml_type) noexcept {
     return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 10 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||

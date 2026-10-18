@@ -131,6 +131,22 @@ void native_iq4_nl_mmvq(const void* weights, const void* x_q8_1, float* y,
 void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream);
 
+// Stage D (R58-verified): the neuron-major ("T") IQ4_NL down kernel for the ReLU^2 sidecar path.  `T` is one
+// expert's sidecar block: n_in*(n_out/2) value bytes first (neuron n's n_out/2 bytes hold its n_out four-bit output
+// rows: byte b = row 2b low nibble, row 2b+1 high), then n_blocks*(n_out*2) scale bytes (group g's fp16 scale of
+// row r at g*(n_out*2) + 2r).  For the same expert and the same Q8_1 row this returns the SAME BITS as
+// native_iq4_nl_mmvq on the row-major bytes (Stage D parity: 3 cases x 2 experts x 1024 rows, memcmp 0), because
+// the thread mapping, the split of a block's int dot between two lanes, the block order, the float d and the warp
+// tree are that kernel's.  Only n_in = 2688, n_out = 1024, ncols = 1 is supported (the packed expert shape).
+void native_iq4_nl_mmvq_T(const void* T, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                          void* stream);
+
+// Stage D (D2a, R58-verified byte-for-byte on 4 real experts): the neuron-major T block -> the original row-major
+// expert bytes, on the device.  T: 2688*512 value bytes then 84*2048 scale bytes; row: 1024*1512 bytes.  This is
+// the ONLY conversion the new architecture needs: every GPU consumer (slots, staging, MMQ) keeps reading today's
+// row-major bytes, produced here from the pinned sidecar.  Pure byte permutation; n_in = 2688, n_out = 1024 only.
+void native_relu2_t_to_row(const void* T, void* row, int n_in, int n_out, void* stream);
+
 // Up to 8 matrices of one format and shape in one launch: matrix i times its own Q8_1 column x[i] into y[i], as
 // native_mmvq(type, w[i], x[i], y[i], n_in, n_out, 1, stream) would each.  A launch costs the calling thread more
 // than a small product costs the card, which is what this saves.  False, with nothing launched: there is no
@@ -141,6 +157,9 @@ struct MmvqSlots {
     float* y[8];
 };
 bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream);
+// Stage D: the slot list with every slot's down matrix in the neuron-major T layout (native_iq4_nl_mmvq_T a slot).
+// False, with nothing launched, when the type has no T kernel (only IQ4_NL has one): the caller falls back.
+bool native_mmvq_slots_T(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream);
 // native_mmvq_slots with the matrices the card picked, so that the launch needs nothing of the host (a decode
 // step's routed experts when every one of them is in VRAM): matrix j is table[ids[j]] + offset bytes, times the
 // Q8_1 column x + (j / x_every) * x_stride bytes, into y + j * y_stride floats.  count may pass 8.  False, with

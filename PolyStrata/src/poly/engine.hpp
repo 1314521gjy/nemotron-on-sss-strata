@@ -787,8 +787,18 @@ protected:
     void* r2d_file_ = nullptr;            ///< the file handle (closed in ~Engine)
     size_t r2d_expert_bytes_ = 0;         ///< one expert's sidecar block = its down bytes in the GGUF
     bool r2d_pinned_ = false;             ///< R57 option B: the sidecar is cudaHostRegisterReadOnly-pinned
+    bool r2d_slots_t_ = false;            ///< Stage D D3: the VRAM slots' down segments hold the T layout
     std::vector<size_t> r2d_layer_off_;   ///< per layer: its experts' first sidecar byte (SIZE_MAX when not main MoE)
-    void relu2_down_open();               ///< load(): map and check the sidecar (loud; off by default)
+    void relu2_down_open();               ///< load(): map, pin and fault in the sidecar (loud; off by default)
+    /// Stage D D2a: one expert's down, ROW-MAJOR, written into `dst` (device: a slot's down segment, a staging
+    /// down area, a swap/borrow region).  Source = the pinned sidecar's T block: one DMA to a one-expert device
+    /// scratch, then the R58-verified T->row kernel.  Every GPU consumer keeps reading today's bytes unchanged.
+    void materialize_down(const Layer& L, int il, size_t e, uint8_t* dst, void* stream);
+    /// Stage D: one 1.48 MiB device scratch a stream (fill's null stream, st_, up_, cp_, swap_st_): the four paths
+    /// can be in flight together (ring2 ahead on up_ beside this layer's stage), so one shared scratch would race.
+    void* r2d_scratch_for(void* stream);
+    std::vector<std::pair<void*, void*>> r2d_scratch_;   ///< (stream, buffer)
+    std::mutex r2d_scratch_m_;
     uint64_t pin_chunks_ = 0, pin_fallback_chunks_ = 0;   ///< stage() chunks taking the direct DMA / the old gather
     uint64_t pin_dmas_ = 0; size_t pin_dma_bytes_ = 0;    ///< the direct path's DMA count and bytes (size check)
     uint64_t fill_dmas_ = 0, swap_dmas_ = 0;              ///< R13: the load fill's and the swaps' copies
