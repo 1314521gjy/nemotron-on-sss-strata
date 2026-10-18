@@ -150,6 +150,29 @@ copy 交付\p_shipped.txt C:\sp3\p_autolearn.txt
   batch 模式若喂 >N 的长提示同样会中招——交付基准 6,792 < 8,192 才一直没暴露。
 - **验证口径**：必须测"**连续多个长请求**"（第 2、3 条），只测第一条会假绿。
 
+### 6.1d 四号坑：**在线学习 × 直拷换槽（`STRATA_SWAP_DIRECT_FROM_PIN`）在 serve 多请求下把专家缓存装错**
+- **症状**：serve 跑一阵后，**长提示（28K）输出 `<unk>`(id 0) 循环**；刚重启时正常；有时是"先正常十几个 token 再全变 unk"。
+- **根因链（本仓实测，代码位置）**：
+  1. `--expert-profile-write` + `STRATA_PROFILE_AUTO_LEARN=1` ⇒ 每次回答后 `use_` 计数变化（`engine.cpp:3418`）；
+  2. 缓存决策用 `prior_ + use_`（`engine.cpp:986 / 1638 / 2142`）⇒ **请求之间缓存重排/搬动**；
+  3. 搬动走 `STRATA_SWAP_DIRECT_FROM_PIN=1` 的"从 pinned 映射直拷 DMA"路径 ⇒ **某些槽装进错数据**；
+  4. 专家权重错 ⇒ logits 变 NaN/全等 ⇒ argmax 恒 0 ⇒ `<unk>` 循环。
+- **判据矩阵（同一 28K 提示，A 级）**：
+
+  | 配置 | 结果 |
+  |---|---|
+  | 静态随包表 + 直拷 ON | ✅ `unk=0`（2/2） |
+  | 学过的表 **只读** + 直拷 ON | ✅ `unk=0` |
+  | 学习 ON + **直拷 ON** | ❌ `unk=255` |
+  | **学习 ON + 直拷 OFF** | ✅ `unk=0`（2/2） |
+
+- **修法（二选一，都已验证）**：
+  - **优先**：serve 保留在线学习、**去掉 `STRATA_SWAP_DIRECT_FROM_PIN`**（自适应 agent 负载，命中会越跑越高）；
+  - 或：serve 用**只读随包表**、关掉 `AUTO_LEARN` / `--expert-profile-write`，保留直拷。
+- **⚠️ 通用教训（本仓一天踩三次）**：`PROMPT_BORROW`、`--prompt-cache-every`、`SWAP_DIRECT_FROM_PIN` 这三条"优化"
+  都只在**单次 batch 跑**里验证过（交付基准 6,792 token、跑完即退出），**在 `--serve` 的连续多请求下逐个翻车**。
+  ⇒ 任何进 serve 的开关，必须用"连续多个长请求"重新验证一遍，不能拿 batch 读数直接外推。
+
 ### 6.1c 三号坑：**收尾 token（EOS）集合必须来自模型自己的 tokenizer**
 - **症状**（服务层）：回答在普通文字中间被截断；或反过来该停不停、继续复读提示词。
 - **根因（本仓修的）**：serve/server.py 继承自 Qwen 系靶子 ——
