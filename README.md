@@ -108,7 +108,37 @@ copy p_shipped.txt p_autolearn.txt
   **本仓所有"位精确/无损"结论届时全部失效，必须重测 ids 与文本质量**。
 - KV 量化（q8/q4）：16K 上下文只省 64 MiB（≈21 槽）**不值得**；只有 **≥128K** 才值得（1M 时 q8 省 4 GiB ≈ +1,322 槽）。
 
-## 5. 已在"判否清单"（**别再试**，都有实测读数）
+## 5. 接入 DSH（本地试玩）
+
+引擎可以以 **OpenAI 兼容服务**的形式常驻，DSH 直接把它当一个 provider 用。
+
+```bat
+rem 1) 起引擎服务（占显存 ~31.2 GB，起前先关掉别的占卡程序）
+C:\sp3\start-nemotron-serve.cmd
+rem    = cd PolyStrata && python -m serve.server --engine strata ^
+rem        --config C:\sp3\serve-nemotron\strata.json --port 8091
+
+rem 2) 重启 DSH（profile 只在启动时读），模型列表里选
+rem    “Nemotron-3.5-Super-VL-120B-A12B · PolyStrata 引擎”
+```
+
+- provider 定义在 `~/.dsh/profiles/desktop/cordis.patch.yml` 的 `llm-pi-ai.providers.nemotron-local`
+  （`baseURL: http://127.0.0.1:8091/v1`；`defaultContextWindow: 1048576`；默认**关思考**，UI 可切 high）
+- 服务端端点：`/v1/chat/completions`、`/v1/messages`（Anthropic）、`/v1/models`、`/health`
+- 首次请求要等模型加载（pin 59.1 GiB，约 20–40 s）；之后常驻
+- 速度：问答类（异构）约 **18–33 tok/s**（关思考时更快），prefill ≈1,754 tok/s（长系统提示要等几秒）
+
+### 凭据与署名（**协议来源**）
+
+| 层 | 来源 |
+|---|---|
+| **模型** | NVIDIA **Nemotron-3.5-Super-VL-120B-A12B**（Q4_K_M GGUF，70.1 GB） |
+| **引擎** | **PolyStrata**（上游 `VecSzn/PolyStrata` 的 fork；本仓只做移植、接线与调参） |
+| **HTTP/行协议** | 上游 **`strata --serve`** 的行协议（`src/program/generate.cpp`：`GEN`/`GENI` → `T` 流），由 `PolyStrata/serve/server.py` 转成 OpenAI / Anthropic 端点 |
+| **tokenizer 目录** | 本仓 `tools/strata_tokenizer.py --gguf <gguf> --out <dir>` 从 GGUF 导出 |
+| **加速机制来源** | 借槽 / 双缓冲 ring / 投机窗口 / 专家表学习等均**源自上游与老师线（strata）**，本仓做的是适配与验证（逐条判否清单见 §6） |
+
+## 6. 已在"判否清单"（**别再试**，都有实测读数）
 
 `MTP 投机`（受控 −1.2%；历史上三次 +21% 均**不可复现**）· `shared expert 独立流`（+1.7%，低于门槛）·
 `snap 快照 3→1`（有窗口时 keep() 重算不位精确）· `GPU 侧 routing`（CUDA/Host `expf` 无位一致保证）·
