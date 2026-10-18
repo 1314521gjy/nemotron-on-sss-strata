@@ -3263,9 +3263,20 @@ void Engine::lin(const Dev& w, const float* x, float* y, int n, const void* xq, 
 
 // STRATA_DUMP_ROUTE=1 only (default 0: never called).
 void Engine::dump_route(const int* ids, int il, int32_t token) {
-    std::fprintf(route_dump_, "%d %d", il, (int) token);
-    for (int k = 0; k < n_used_; ++k) std::fprintf(route_dump_, " %d", ids[k]);
-    std::fputc('\n', route_dump_);
+    // One line, one write.  The old code did three fprintf + fputc with no lock, and the prefill path routes from 16
+    // worker threads, so lines interleaved: the R74 dump had 1 to 168 fields a line.  Build the line in a local
+    // buffer, then take a process-wide mutex for the single fwrite.
+    static std::mutex m;
+    char line[(2 + 22) * 12 + 4];
+    int at = std::snprintf(line, sizeof line, "%d %d", il, (int) token);
+    for (int k = 0; k < n_used_ && at > 0 && (size_t) at + 12 < sizeof line; ++k)
+        at += std::snprintf(line + at, sizeof line - (size_t) at, " %d", ids[k]);
+    if (at < 0 || (size_t) at >= sizeof line - 1) return;
+    line[at++] = '\n';
+    {
+        std::lock_guard<std::mutex> lk(m);
+        std::fwrite(line, 1, (size_t) at, route_dump_);
+    }
 }
 
 void Engine::router_scores(const Layer& L, int n) { lin(L.gate_inp, xn_, rl_, n, xq_); }
