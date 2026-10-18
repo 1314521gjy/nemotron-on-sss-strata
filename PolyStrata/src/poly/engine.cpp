@@ -589,6 +589,13 @@ void Engine::relu2_down_open() {
         refuse("the sidecar does not match the GGUF's down bytes");
         return;
     }
+    // Stage D D1: the T down kernel is built and R58-verified (native_iq4_nl_mmvq_T), but the VRAM slots still hold
+    // the row-major down until D3 swaps the slot layout.  =1 must never silently run either layout: until D3 sets
+    // r2d_slots_t_, the switch is refused loudly (the default path, =0, is untouched).
+    if (!r2d_slots_t_) {
+        refuse("Stage D D1 build: the neuron-major slot layout (D3) is not enabled yet; STRATA_RELU2_DOWN=1 refused");
+        return;
+    }
     // R57c (D0): the sidecar is NOT pinned here.  Prefill runs with the delivery's usual pin inventory (the GGUF's
     // up AND down halves, pinned by pin_expert_arena()), and the down half's pin changes hands at the decode
     // boundary in relu2_pin_switch().  Only the four check experts have been touched (6.2 MB): this is a mapping.
@@ -2136,6 +2143,15 @@ void Engine::load(const Options& o) {
                      "tail%s\n",
                      !borrow_lend_ ? "; STRATA_PROMPT_BORROW_SLOTS=0, none lent: they hold their own VRAM"
                      : borrow_refill_ ? "" : "; STRATA_PROMPT_BORROW_REFILL=0, nothing is put back");
+    // STRATA_CUT_HANDOFF: the per-layer handoff cuts (C1: a layer's routed-experts sum and latent projection are
+    // recorded once and replayed with one call; C3: a few rows' activation conversion runs on the calling thread
+    // instead of a worker pass).  Off by default - the delivery default is the old path byte for byte; =1 turns
+    // them on for the A/B.
+    if (const char* e = std::getenv("STRATA_CUT_HANDOFF"))
+        std::fprintf(stderr, "strata-poly: STRATA_CUT_HANDOFF=%s: %s\n", e,
+                     e[0] == '1' && e[1] == '\0'
+                         ? "on (the add+latent pair recorded a layer; the activation pass inline for a few rows)"
+                         : "off (the old launches)");
     gg_ = std::make_unique<Shards>(opt_.model);
     if (!opt_.draft_model.empty() && opt_.draft && opt_.window != 1) dg_ = std::make_unique<Shards>(opt_.draft_model);
     load_geometry();
@@ -3112,7 +3128,13 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 else if (gelu_) geglu_rows(g_, h_, n_ff_exp_, m, st_);
                 else swiglu_clamp_rows(g_, h_, n_ff_exp_, m, limit, st_);
                 kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
-                if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, out_w, st_)))
+                if (r2d_slots_t_) {   // Stage D D3: the slot's down segment holds the neuron-major T layout
+                    if (m > 1)
+                        kernels::native_mmvq_slots_T((int) L.d_type, down, m, n_ff_exp_, out_w, st_);
+                    else
+                        for (int j = 0; j < m; ++j)
+                            kernels::native_iq4_nl_mmvq_T(down.w[j], down.x[j], down.y[j], n_ff_exp_, out_w, 1, st_);
+                } else if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, out_w, st_)))
                     for (int j = 0; j < m; ++j)
                         kernels::native_mmvq((int) L.d_type, down.w[j], down.x[j], down.y[j], n_ff_exp_, out_w, 1,
                                              st_);
@@ -3172,7 +3194,14 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                     else if (gelu_) geglu_rows(g_, h_, n_ff_exp_, m, st_);
                     else swiglu_clamp_rows(g_, h_, n_ff_exp_, m, limit, st_);
                     kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
-                    if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, out_w, st_)))
+                    if (r2d_slots_t_) {   // Stage D D3: the slot's down segment holds the neuron-major T layout
+                        if (m > 1)
+                            kernels::native_mmvq_slots_T((int) L.d_type, down, m, n_ff_exp_, out_w, st_);
+                        else
+                            for (int j = 0; j < m; ++j)
+                                kernels::native_iq4_nl_mmvq_T(down.w[j], down.x[j], down.y[j], n_ff_exp_, out_w, 1,
+                                                              st_);
+                    } else if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, out_w, st_)))
                         for (int j = 0; j < m; ++j)
                             kernels::native_mmvq((int) L.d_type, down.w[j], down.x[j], down.y[j], n_ff_exp_, out_w, 1,
                                                  st_);
@@ -3272,6 +3301,10 @@ bool Engine::card_moe(int n) {
 // the card, an expert's slot read from d_slots_ by its pick.  False, with nothing launched: this layer is routed
 // on the host, or its formats have no kernel for picks on the card.
 bool Engine::moe_card(Layer& L, int il, int n) {
+    if (r2d_slots_t_) {   // Stage D: the card's routed down kernel reads the row-major slot; the T layout is D3+
+        L.card = 0;
+        return false;
+    }
     if (!L.gated) return false;   // the card's routed launches are wired for gated experts (moe_rows() takes it next)
     if (L.card == 0) return false;
     if (!kernels::native_mmvq_ids_supported((int) L.gu_type) || !kernels::native_mmvq_ids_supported((int) L.d_type) ||
@@ -4020,7 +4053,23 @@ void Engine::run(const int32_t* tokens, int n) {
         if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, m); });
         else layer_tail(L, il, m);
     };
-
+    // STRATA_CUT_HANDOFF: a layer's routed-experts sum and its latent projection are the same launches for a token
+    // at a time, so the pair is recorded once as a graph a kind - with the CPU experts' sum and without it - and
+    // replayed with one call.  Only a token at a time is recorded: a window moves the buffers (shift_rows()), so its
+    // launches stay the ones they were.  The cache lives here, keyed by this engine and the layer: a graph recorded
+    // for one engine's buffers is never replayed by another's.
+    static const bool cut_handoff = [] {
+        const char* e = std::getenv("STRATA_CUT_HANDOFF");
+        return e && e[0] == '1' && e[1] == '\0';   // off by default: the delivery path is the old launches
+    }();
+    static std::map<std::pair<const void*, std::pair<int, int>>, std::vector<void*>> after_graphs;
+    const auto replay_after = [&](int il, bool added, const std::function<void()>& work) {
+        std::vector<void*>& made =
+            after_graphs[std::make_pair((const void*) this, std::make_pair(il, added ? 1 : 0))];
+        if (made.empty()) made.resize(1, nullptr);
+        if (!made[0]) made[0] = record(work);
+        ck(cudaGraphLaunch((cudaGraphExec_t) made[0], cs(st_)), "layer graph");
+    };
     // A window's tokens, with experts on the CPU, go through the layers together or in two halves, one behind
     // the other (halves_, which window() sets).  Together, the card's part of a layer and the CPU's take turns:
     // the card waits out the CPU's experts and the CPU the card's layer.  In halves each has work while the
@@ -4149,9 +4198,21 @@ void Engine::run(const int32_t* tokens, int n) {
         Layer& L = layers_[(size_t) il];
         up(il, n, (size_t) n - 1);
         if (!L.moe) continue;
-        if (batched(L, n)) moe_rows(L, il, n);
-        else if (!on_card(il, n, (size_t) n - 1) && moe(L, il, n)) moe_add(L, n);
-        moe_latent(L, n);
+        bool added = false;
+        if (batched(L, n)) {
+            moe_rows(L, il, n);
+        } else {
+            added = !on_card(il, n, (size_t) n - 1) && moe(L, il, n);
+        }
+        if (cut_handoff && replay && n == 1 && L.fixed) {
+            replay_after(il, added, [&] {
+                if (added) moe_add(L, n);
+                moe_latent(L, n);
+            });
+        } else {
+            if (added) moe_add(L, n);
+            moe_latent(L, n);
+        }
         tail(il, n, (size_t) n - 1);
     }
 }

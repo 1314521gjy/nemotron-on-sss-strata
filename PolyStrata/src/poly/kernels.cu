@@ -2775,12 +2775,31 @@ void mamba2_scan(const float* xbc, const float* dt, const float* A, const float*
     const int head_dim = dim / n_head;
     if (head_dim > 1024) throw std::invalid_argument("mamba2_scan: head_dim over the 1024 a block has");
     if (dt_stride < n_head) dt_stride = n_head;       // 0: the dt rows are contiguous
-    // Opt-in (STRATA_M2_SCAN_SMEM=1): hold each thread's state row in shared memory for the whole scan.  A fallback
-    // to the global path is LOUD: a silent one would read as "the flag did nothing" and mislead the very A/B it is for.
-    static const bool smem_state = []() {
+    // Opt-in (STRATA_M2_SCAN_SMEM): hold each thread's state row in shared memory for the whole scan.  "1" = every
+    // call; "0" or unset = none (the original kernel, byte for byte); "auto" = only the calls whose row count fills
+    // the block: a token at a time (rows 1) does not, and there the shared row costs more than it saves (E1: -2.4%).
+    // A dynamic shared allocation the card cannot take is LOUD: under "auto" it is refused (no silent wrong path),
+    // under "1" the original loud fallback to the global path stays.  Any other value is a mistake and throws.
+    enum SmemMode : int { kSmemOff = 0, kSmemOn = 1, kSmemAuto = 2 };
+    static const SmemMode smem_mode = []() {
         const char* e = std::getenv("STRATA_M2_SCAN_SMEM");
-        return e && e[0] == '1' && e[1] == '\0';
+        if (e == nullptr || e[0] == '\0') return kSmemOff;
+        if (e[0] == '1' && e[1] == '\0') {
+            std::fprintf(stderr, "strata-poly: STRATA_M2_SCAN_SMEM=1: the scan's state rows are in shared memory\n");
+            return kSmemOn;
+        }
+        if (e[0] == '0' && e[1] == '\0') {
+            std::fprintf(stderr, "strata-poly: STRATA_M2_SCAN_SMEM=0: the scan's state rows are in global memory\n");
+            return kSmemOff;
+        }
+        if (std::strcmp(e, "auto") == 0) {
+            std::fprintf(stderr, "strata-poly: STRATA_M2_SCAN_SMEM=auto: shared state only for more than 32 tokens a "
+                                 "call (a token at a time keeps the global path)\n");
+            return kSmemAuto;
+        }
+        throw std::runtime_error(std::string("STRATA_M2_SCAN_SMEM must be 0, 1 or auto, not '") + e + "'");
     }();
+    const bool smem_state = smem_mode == kSmemOn || (smem_mode == kSmemAuto && rows > 32);
 #if 0   // R14b: the warp launcher and its micro parity (reverted with the kernel above; the old path below is
         // byte for byte the one that shipped in af913812's source state).
     // WARP (opt-in, STRATA_M2_SCAN_WARP=1): one warp a (head, value) pair with the d_state row over its 32 lanes -
@@ -2930,6 +2949,11 @@ void mamba2_scan(const float* xbc, const float* dt, const float* A, const float*
             return;
         }
         static bool warned = false;
+        if (smem_mode == kSmemAuto)   // "auto" said shared memory for this call: a card that cannot take it is a loud
+            throw std::runtime_error( // failure, not a silent global-path run that the A/B would read as "auto did nothing"
+                "mamba2_scan/STRATA_M2_SCAN_SMEM=auto: rows=" + std::to_string(rows) +
+                " chose the shared-state path but the card takes only " + std::to_string(optin >> 10) +
+                " KiB of dynamic shared (needs " + std::to_string(need >> 10) + " KiB)");
         if (!warned) {
             warned = true;
             std::fprintf(stderr,
