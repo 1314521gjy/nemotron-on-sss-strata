@@ -67,6 +67,20 @@ constexpr int kClasses = (int) (sizeof(kTile) / sizeof(kTile[0])) + 1;
 // whose rows lie one interval [r0, r0 + rows).  8192 rows is a few hundred MiB at this model's expert widths.
 constexpr size_t kScratchRows = 8192;
 
+// STRATA_DRAFT_CHUNKED: the draft block's rows are primed a chunk of tokens at a time (three row sets - the normed
+// embedding, the normed model output, and the block's residual - of at most kWayDraftChunk + kStageRows - 1 tokens)
+// in a scratch of their own, instead of three whole-call row sets inside r_.  r_ then keeps the size a run without
+// the draft block has, and the MTP's VRAM falls by the row sets it used to hold for it.  Off by default.
+constexpr int kWayDraftChunk = 512;
+constexpr int kDraftChunkMax = kWayDraftChunk + 31;   // a chunk's tokens: the remainder after a chunk joins the one before
+bool draft_chunked() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_DRAFT_CHUNKED");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
+
 // STRATA_PROMPT_BORROW: the most of the expert cache's tail slots the prompt path may be lent, and the VRAM a run
 // keeps free whatever it lends (the desktop's, as R21 keeps it): a lend beyond either is refused loudly.
 constexpr int kBorrowMaxSlots = 2048;
@@ -2735,8 +2749,10 @@ void Engine::load_drafter() {
 void Engine::shared_scratch() {
     const size_t n = (size_t) rows_, e = n * n_embd_;
     const size_t ff = n * std::max({n_ff_, n_ff_shexp_, 2 * n_ff_exp_});
-    // the draft block works in it too (draft_input()); read() keeps two calls' rows in it
-    r_ = fbuf(std::max(streams(), draft_ ? 3 : 1) * (size_t) (read_rows_ > rows_ ? 2 : 1) * rows_ * n_embd_);
+    // the draft block works in it too (draft_input()); read() keeps two calls' rows in it.  STRATA_DRAFT_CHUNKED:
+    // the block's three row sets move to draft_work_, so r_ is the size a run without the draft block has.
+    r_ = fbuf(std::max<size_t>((size_t) streams(), (size_t) ((draft_ && !draft_chunked()) ? 3 : 1)) *
+              (size_t) (read_rows_ > rows_ ? 2 : 1) * rows_ * n_embd_);
     cur_ = fbuf(e);
     xn_ = fbuf(e);
     ao_ = fbuf(e);
@@ -2796,6 +2812,17 @@ void Engine::alloc() {
     }
     // window(): the state after tokens of it, for keep(), and every token's logits
     snap_places_ = snaps_spread() ? std::min(opt_.window - 1, kSnapPlaces) : opt_.window - 1;
+    // STRATA_SNAP_PLACES=1|2|3: how many of the window's states are kept.  With fewer, keep() has the state after
+    // the last accepted token that left one only, and runs the accepted tokens after it through the layers again
+    // (that path already exists and its results are the ones the state would have had - see keep("the right tokens
+    // after that one go through the layers again")).  Default: the places above, byte for byte the old allocation.
+    if (const char* e = std::getenv("STRATA_SNAP_PLACES")) {
+        const int asked = std::atoi(e);
+        if (asked < 1) throw std::runtime_error("STRATA_SNAP_PLACES must be at least 1");
+        snap_places_ = std::min(snap_places_, asked);
+        std::fprintf(stderr, "snap: %d places (%.1f MiB)\n", snap_places_,
+                     (double) (size_t(snap_places_) * rec_n_ * sizeof(float)) / (1024.0 * 1024.0));
+    }
     if (snap_places_ > 0)
         snap_ = (float*) dmalloc(size_t(snap_places_) * rec_n_ * sizeof(float), "the recurrent state");
     wlogits_ = (float*) dmalloc(size_t(opt_.window) * n_vocab_ * sizeof(float), "scratch");
@@ -2935,6 +2962,15 @@ void Engine::alloc() {
     } else if (shared_overlap_env) {
         std::fprintf(stderr, "strata-poly: STRATA_SHARED_OVERLAP=1 needs a shared expert and experts outside the "
                              "cache (the recorded-graph path keeps the old call): the switch stays off\n");
+    }
+    // STRATA_DRAFT_CHUNKED=1: the draft block's priming rows (three row sets of at most kDraftChunkMax tokens) get a
+    // scratch of their own, so r_ keeps the size a run without the draft block has and the MTP's VRAM falls by the
+    // row sets it used to hold for the block.
+    if (draft_ && draft_chunked()) {
+        draft_work_ = (float*) dmalloc(3 * (size_t) kDraftChunkMax * (size_t) n_embd_ * sizeof(float),
+                                       "the draft block's rows");
+        std::fprintf(stderr, "draft-priming: chunked (%zu MiB scratch; r_ back to non-draft size)\n",
+                     (3 * (size_t) kDraftChunkMax * (size_t) n_embd_ * sizeof(float)) >> 20);
     }
 
     h_r_ = (float*) hmalloc(n * streams() * n_embd_ * sizeof(float), "pinned memory");
@@ -4933,7 +4969,8 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     ck(cudaStreamSynchronize(cs(st_)), "read");
     if (n_swap_ > 0) follow(0);
     const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row, r_bytes = r_row * sizeof(float);
-    const size_t part = (size_t) std::max(streams(), draft_ ? 3 : 1) * rows_ * e_row;   // a call's rows of r_
+    const size_t part =
+        std::max<size_t>((size_t) streams(), (size_t) ((draft_ && !draft_chunked()) ? 3 : 1)) * rows_ * e_row;   // r_'s half
     const float scale = embed_scale();
     float* const r0 = r_;
     const int64_t pos0 = pos_;
@@ -5190,6 +5227,9 @@ void Engine::keep(int n) {
 // call after another without waiting for the card in between.
 float* Engine::draft_input(const int32_t* tokens, int64_t row, const float* h, int n) {
     const size_t e = (size_t) n_embd_, rows = (size_t) n;
+    // STRATA_DRAFT_CHUNKED: the three row sets live in draft_work_ (a chunk of tokens at most), not in r_ - r_ keeps
+    // the size a run without the draft block has.  Otherwise they are r_'s first three row sets, as they always were.
+    float* const work = (draft_ && draft_chunked()) ? draft_work_ : r_;
     // read()'s draft turn calls this for one call after another without waiting for the card: the copy of the call
     // before may still be reading h_r_, so the host waits for it before writing the next call's rows
     if (!ev_hr_) {
@@ -5203,10 +5243,10 @@ float* Engine::draft_input(const int32_t* tokens, int64_t row, const float* h, i
     if (n < kStageRows) copy2(h_r_, cur_, n * n_embd_, nullptr, nullptr, 0, st_);
     else ck(cudaMemcpyAsync(cur_, h_r_, rows * e * sizeof(float), cudaMemcpyHostToDevice, cs(st_)), "embed");
     ck(cudaEventRecord((cudaEvent_t) ev_hr_, cs(st_)), "embed");
-    rms_norm(cur_, fp(d_enorm_), r_, n_embd_, n, rms_eps_, st_, 2 * n_embd_);
-    rms_norm(h, fp(d_hnorm_), r_ + e, n_embd_, n, rms_eps_, st_, 2 * n_embd_);
-    float* x = r_ + 2 * rows * e;
-    lin(d_proj_, r_, x, n);
+    rms_norm(cur_, fp(d_enorm_), work, n_embd_, n, rms_eps_, st_, 2 * n_embd_);
+    rms_norm(h, fp(d_hnorm_), work + e, n_embd_, n, rms_eps_, st_, 2 * n_embd_);
+    float* x = work + 2 * rows * e;
+    lin(d_proj_, work, x, n);
     rms_norm(x, fp(layers_[(size_t) n_layer_].attn_norm), xn_, n_embd_, n, rms_eps_, st_);
     kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
     return x;
@@ -5218,8 +5258,23 @@ float* Engine::draft_input(const int32_t* tokens, int64_t row, const float* h, i
 void Engine::draft_rows(const int32_t* tokens, int first, int n) {
     const size_t e = (size_t) n_embd_;
     if (block_layer_ && first < n) {
-        draft_input(tokens + first, pos_ + first, hn_ + (size_t) first * e, n - first);
-        block_rows(pos_ + first, n - first);
+        if (draft_ && draft_chunked()) {
+            // STRATA_DRAFT_CHUNKED: a chunk of tokens at a time, in draft_work_.  Every chunk but the last has
+            // kWayDraftChunk tokens and the last takes the remainder; when the remainder is under kStageRows it
+            // joins the chunk before, so every chunk takes the same batched path a whole call takes, and a token's
+            // rows depend on that token alone (block_rows writes only that token's k/v row).  The priming is the
+            // same rows a whole call primes, in the same order.
+            for (int off = first; off < n;) {
+                int m = std::min(kWayDraftChunk, n - off);
+                if (n - off - m > 0 && n - off - m < kStageRows) m = n - off;
+                draft_input(tokens + off, pos_ + off, hn_ + (size_t) off * e, m);
+                block_rows(pos_ + off, m);
+                off += m;
+            }
+        } else {
+            draft_input(tokens + first, pos_ + first, hn_ + (size_t) first * e, n - first);
+            block_rows(pos_ + first, n - first);
+        }
     }
     copy2(hn_ + (size_t) n * e, hn_, n_embd_, nullptr, nullptr, 0, st_);
     ahead_pos_ = -1;

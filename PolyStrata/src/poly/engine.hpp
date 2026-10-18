@@ -689,6 +689,9 @@ protected:
 
     // device scratch: a layer's input streams, one stream, the normed input, the attention's and the FFN's output
     float *r_ = nullptr, *cur_ = nullptr, *xn_ = nullptr, *ao_ = nullptr, *fo_ = nullptr;
+    // STRATA_DRAFT_CHUNKED=1: the draft block's priming rows (three row sets a chunk) in a scratch of their own, so
+    // r_ keeps its non-draft size and the MTP's VRAM falls by the row sets it used to hold for the draft block.
+    float* draft_work_ = nullptr;
     // A latent MoE (Nemotron): the experts read and write the layer's latent width, so their input is a projection
     // of the normed input and their sum is projected back before it is added to fo_.  moe_in_ is the experts' input
     // (xn_ itself when the layer has no latent_down); moe_out_ is their sum until latent_up maps it into fo_.
