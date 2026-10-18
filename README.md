@@ -1,18 +1,14 @@
 > ## ⚠️ WIP — 施工中，暂无成品方案，有思路可参与研究
 > 本项目**处于施工阶段**；现有读数与结论均为**过程证据**，不构成交付承诺。
-> 有思路 / 想一起研究，欢迎参与（issues / 讨论；仓内 `P3-20261016/` 有完整路线与判据）。
+> 有思路 / 想一起研究，欢迎参与（issues / 讨论）。
 > 主结论只对「RTX 4080 SUPER 32 GB + 96 GB RAM + i7-13790F」这一套硬件成立；
 > **换显卡前请先读 §4「其他显卡的适配方向」**——参数不是照抄就有同样效果。
 
 # Nemotron on SSS-Strata
 
-本仓是 2026-10-15→18 **Nemotron-on-Strata** 实验的**研发路线、判据、注意事项与回执存档**；
-源码树 `PolyStrata/` 与本文档**同在本仓**（2026-10-18 单仓合并；上游历史保留在 `PolyStrata/.git-upstream`）。
-
-目标：把 **NVIDIA Nemotron-3.5-Super-VL-120B-A12B（Q4_K_M，70.1 GB）** 跑在**单张 32 GB 消费卡**上——
+把 **NVIDIA Nemotron-3.5-Super-VL-120B-A12B（Q4_K_M，70.1 GB）** 跑在**单张 32 GB 消费卡**上：
 专家权重 pin 在内存（59.1 GiB）、按路由把用到的专家流式搬进 VRAM、未驻留专家由 CPU 分担。
-
----
+引擎是本仓 `PolyStrata/`（上游 PolyStrata 的 fork + 本仓改动）。
 
 ## 1. 当前交付参数（**唯一推荐**，本机实测）
 
@@ -44,6 +40,7 @@ sp_seeded.exe --model <gguf> --tokens-file <ids> \
 | 输出一致性 | ids 与旧基线**逐位相同** | — |
 
 **异构（问答/代码类）prompt：decode ≈18–20 tok/s。** 模板型负载会显著更快——**别把模板数字当通用值**。
+异构负载上**关掉投机**（`--lookup 0`）反而更快（实测 +9.6%），因为 n-gram 在多样文本上猜不中。
 
 ## 2. 关键机制（都默认关，交付脚本显式打开）
 
@@ -55,19 +52,21 @@ sp_seeded.exe --model <gguf> --tokens-file <ids> \
 | `STRATA_PROFILE_AUTO_LEARN=1` | 首跑自动建 decode-only 专家表、次跑自动加载并继续学 | decode +38.4%（首跑略慢） |
 | `--max-context 1048576` | VMM 按需映射；上限 ≠ 预分配 | 峰值仅 +3 MiB |
 
-**专家表**：随包 `P3-20261016/交付/p_shipped.txt`（170,796 B / 16,900 行）。安装时复制为可写工作表：
+**随包专家表** `交付/p_shipped.txt`（170,796 B / 16,900 行）。安装时复制为可写工作表：
 
 ```bat
-copy p_shipped.txt p_autolearn.txt
+copy 交付\p_shipped.txt C:\sp3\p_autolearn.txt
 ```
 
 ## 3. 目录
 
-- `P3-20261016/` —— P3 阶段主台账、判据、情报、施工单、`回执/`（逐轮交付回执）、`验收/`、`交付/`（随包专家表与交付物清单）
-- `P0-20261016/`、`P2-20261016/` —— 前置阶段（基座裁决 / 单元格校准）
-- 根目录 —— 项目书、协作规则总纲、交接件、计划件、机制消化件
-- `P3-20261016/git/` —— 建仓留痕（改动前 status、提交后 show --stat、GIT 台账）
-- **`P3-20261016/下一棒交接-20261018-收工.md` = 唯一权威状态件**（全部读数、判否清单、纪律）
+| 路径 | 内容 |
+|---|---|
+| `PolyStrata/` | 引擎源码（fork 自上游；上游历史在 `PolyStrata/.git-upstream`） |
+| `交付/` | 随包专家表 `p_shipped.txt` + `交付物清单-20261018.md` |
+| `README.md` | 本文件（参数 / 适配 / 判否清单 / 署名） |
+
+> 阶段过程文档（项目书、台账、回执、情报、验收、协作与调度规则等）**不入库**，按项目惯例另存仓外归档。
 
 ## 4. 其他显卡的适配方向（**换卡必读**）
 
@@ -92,6 +91,7 @@ copy p_shipped.txt p_autolearn.txt
 | `--max-context` | 可直接开到任务上限（VMM 按需） | 峰值只随**实际用到**的长度长：128K 花 1 GiB、1M 花 8 GiB。**长上下文是从专家槽里扣的** |
 | `--prompt-batch` `--prompt-cache-every` | 有 **43 GB 重复预填墙** | 本机 6912 / 8192；更大卡可试 8192/8192，盯 prefill 的重复字节 |
 | `--expert-swaps` | 64（1..64） | 32 时 −5.1% |
+| `--lookup` | 模板型负载 3；**异构负载 0** | 异构负载上 n-gram 猜不中，投机白花钱（实测关掉 +9.6%） |
 
 ### 4.3 换卡时先看两件事
 
@@ -108,51 +108,28 @@ copy p_shipped.txt p_autolearn.txt
   **本仓所有"位精确/无损"结论届时全部失效，必须重测 ids 与文本质量**。
 - KV 量化（q8/q4）：16K 上下文只省 64 MiB（≈21 槽）**不值得**；只有 **≥128K** 才值得（1M 时 q8 省 4 GiB ≈ +1,322 槽）。
 
-## 5. 接入 DSH（本地试玩）
-
-引擎可以以 **OpenAI 兼容服务**的形式常驻，DSH 直接把它当一个 provider 用。
-
-```bat
-rem 1) 起引擎服务（占显存 ~31.2 GB，起前先关掉别的占卡程序）
-C:\sp3\start-nemotron-serve.cmd
-rem    = cd PolyStrata && python -m serve.server --engine strata ^
-rem        --config C:\sp3\serve-nemotron\strata.json --port 8091
-
-rem 2) 重启 DSH（profile 只在启动时读），模型列表里选
-rem    “Nemotron-3.5-Super-VL-120B-A12B · PolyStrata 引擎”
-```
-
-- provider 定义在 `~/.dsh/profiles/desktop/cordis.patch.yml` 的 `llm-pi-ai.providers.nemotron-local`
-  （`baseURL: http://127.0.0.1:8091/v1`；`defaultContextWindow: 1048576`；默认**关思考**，UI 可切 high）
-- 服务端端点：`/v1/chat/completions`、`/v1/messages`（Anthropic）、`/v1/models`、`/health`
-- 首次请求要等模型加载（pin 59.1 GiB，约 20–40 s）；之后常驻
-- 速度：问答类（异构）约 **18–33 tok/s**（关思考时更快），prefill ≈1,754 tok/s（长系统提示要等几秒）
-
-### 凭据与署名（**协议来源**）
-
-| 层 | 来源 |
-|---|---|
-| **模型** | NVIDIA **Nemotron-3.5-Super-VL-120B-A12B**（Q4_K_M GGUF，70.1 GB） |
-| **引擎** | **PolyStrata**（上游 `VecSzn/PolyStrata` 的 fork；本仓只做移植、接线与调参） |
-| **HTTP/行协议** | 上游 **`strata --serve`** 的行协议（`src/program/generate.cpp`：`GEN`/`GENI` → `T` 流），由 `PolyStrata/serve/server.py` 转成 OpenAI / Anthropic 端点 |
-| **tokenizer 目录** | 本仓 `tools/strata_tokenizer.py --gguf <gguf> --out <dir>` 从 GGUF 导出 |
-| **加速机制来源** | 借槽 / 双缓冲 ring / 投机窗口 / 专家表学习等均**源自上游与老师线（strata）**，本仓做的是适配与验证（逐条判否清单见 §6） |
-
-## 6. 已在"判否清单"（**别再试**，都有实测读数）
+## 5. 已在"判否清单"（**别再试**，都有实测读数）
 
 `MTP 投机`（受控 −1.2%；历史上三次 +21% 均**不可复现**）· `shared expert 独立流`（+1.7%，低于门槛）·
 `snap 快照 3→1`（有窗口时 keep() 重算不位精确）· `GPU 侧 routing`（CUDA/Host `expf` 无位一致保证）·
 `RouterLookahead / ForesightSwap`（相邻层路由重合率 **4.23% ≈ 随机 4.30%**）· `KV 进内存`（依赖模型自带的 QSA indexer，我们没有）·
 `pcie 分流`（direct 模式 −23%）· `tail-skip`（有损）· `per-layer 槽配额`（0 增益）·
 `专家组预取/缓存`（带宽净亏）· `head alias`（真杠杆其实是预取分母）· `ReLU² down 重排`（T 内核延迟受限）·
-`异构图模式`（alt +8.6% 但 qa −13.8%，不通用）
+`异构模式`（alt +8.6% 但 qa −13.8%，不通用）
 
-完整 55+ 条与逐条读数见 §3 交接件。
+## 6. 来源与署名
 
-## 6. 使用注意
+| 层 | 来源 |
+|---|---|
+| **模型** | NVIDIA **Nemotron-3.5-Super-VL-120B-A12B**（Q4_K_M GGUF，70.1 GB） |
+| **引擎** | **PolyStrata**（上游 `VecSzn/PolyStrata` 的 fork；本仓只做移植、接线与调参） |
+| **引擎协议** | 上游 **`strata --serve`** 的行协议（`src/program/generate.cpp`：`GEN`/`GENI` → `T` 流）；HTTP/OpenAI 兼容层由 `PolyStrata/serve/server.py` 提供 |
+| **tokenizer** | 由本仓 `tools/strata_tokenizer.py --gguf <gguf> --out <dir>` 从 GGUF 导出（含模型自带 chat template） |
+| **加速机制** | 借槽 / 双缓冲 ring / 投机窗口 / 专家表学习等均**源自上游与老师线（strata）**；本仓做适配、实测与逐条判否 |
 
-1. 本仓只收**文档**与**小脚本**；日志、模型、exe、构建产物、实验数据一律不入库（`.gitignore` 有逐类清单）。
-2. 结论的证据等级与"怎么变红"写在各自文档里；**未验条目标 `未验`**。引用行号前先核对 `sha256`（源码在动）。
-3. 源码 `PolyStrata/` 原本是独立 git 仓库，现已并入本仓（上游历史在 `PolyStrata/.git-upstream`）。
-4. **任何涉及专家表的 A/B 必须冻结表**（`STRATA_PROFILE_AUTO_LEARN=0` + 四臂同一只读表 + 自证 `saved=0`），
+## 7. 使用注意
+
+1. 本仓只收**项目必须内容**（源码 / 交付物 / 本说明）；日志、模型、exe、构建产物、实验数据一律不入库（`.gitignore` 有逐类清单）。
+2. 结论的证据等级与"怎么变红"写在提交信息与判否清单里；**未验条目标 `未验`**。引用行号前先核对 `sha256`（源码在动）。
+3. **任何涉及专家表的 A/B 必须冻结表**（`STRATA_PROFILE_AUTO_LEARN=0` + 同一只读表 + 自证 `saved=0`），
    否则表会在批次里漂移，产生**假阳性**（本仓踩过一次：看似 +21.9%，受控后是 −1.2%）。
