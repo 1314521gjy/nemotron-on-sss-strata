@@ -265,7 +265,7 @@ public:
     /// in the model's place.  p is the probability the block gives what it returns.  pos() + i must be inside the
     /// context.  logits() is left alone.  An architecture may guess with a small model of its own instead of a
     /// block (draft_step()); the calls are the same.
-    bool drafts() const { return next_ ? next_->drafts() : draft_; }
+    bool drafts() const { return next_ ? next_->drafts() : drafting(); }
     /// Test only: the calls read()'s layer-major path gave the draft block's rows (draft_rows()) on the card that has
     /// the block, since load.  Two or more in one read are back-to-back refills of its pinned input rows.
     int64_t read_draft_calls_for_test() const { return next_ ? next_->read_draft_calls_for_test() : read_draft_calls_; }
@@ -577,6 +577,12 @@ protected:
     Dev out_norm_, output_;
     bool draft_ = false;
     bool block_layer_ = false;    ///< what guesses ahead is a block after the model's layers (layers_' last)
+    /// STRATA_DRAFT_LOAD_ONLY=1: the block is loaded and wired and its VRAM kept, but nothing is computed from it and
+    /// no guess is proposed - so a run has the numbers of one without a draft block and the VRAM of one with it.  An
+    /// experiment switch for telling a draft block's VRAM cost from its computation; off unless the variable says 1.
+    bool draft_load_only_ = false;
+    /// Whether the block that guesses ahead computes and proposes: draft_ and not held back by STRATA_DRAFT_LOAD_ONLY.
+    bool drafting() const { return draft_ && !draft_load_only_; }
     Dev d_proj_, d_enorm_, d_hnorm_, d_head_;   ///< the draft block's input projection and norms, and its output norm
     const uint8_t* tok_embd_ = nullptr;   ///< the token table in the mapped file, tok_row_ bytes a token
     size_t tok_row_ = 0;

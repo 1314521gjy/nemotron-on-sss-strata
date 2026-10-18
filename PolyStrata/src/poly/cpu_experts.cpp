@@ -3,12 +3,18 @@
 
 #include "threads.hpp"
 
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/kq_avx2.hpp"
+
 #include "ggml.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 #include <mutex>
@@ -19,7 +25,9 @@ namespace {
 
 // Rows of gate and up, and of down, a task.  With fewer tasks than several a thread, the last round left threads
 // idle at the end of every layer: 64 rows gave Tiel's 512-row experts 8 tasks each, and its down products 32 tasks.
-constexpr int kRowsPerTask = 32;
+// R36: 32 -> 64 for the up rows (the row kernels below decode an expert's weights once for several uses, so longer
+// runs per task pay; the arithmetic is unchanged).
+constexpr int kRowsPerTask = 64;
 constexpr int kRowsPerDownTask = 16;
 constexpr int kSpinsBeforeSleep = 20000;   // about a millisecond of pause instructions
 
@@ -179,6 +187,27 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     const size_t d_row = ggml_row_size((ggml_type) d_type, n_ff);
     const size_t a_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
     const size_t h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
+    // R36: the row kernels in strata_kernels_cpu (kq256_rows for the Q4_K up rows) on the non-gated latent experts:
+    // one decode of an expert's weights per run of its uses instead of one per use.  The kernel path is bit-exact
+    // against ggml's per-token dots (src/poly/cpu_kernel_parity.cpp), but R36 measured no decode gain (B1/B0 = -1.1%,
+    // the window's expert runs hold ~1.2 uses), so it stays OFF by default: the release path is the one below it,
+    // byte-identical to the last build.  STRATA_POLY_CPU_KERNELS=1 turns it on for an experiment.
+    static const bool kernels = [] {
+        const char* e = std::getenv("STRATA_POLY_CPU_KERNELS");
+        return e != nullptr && std::atoi(e) != 0 && strata::kernels::cpu::cpu_avx2_ok();
+    }();
+    // Only the Q4_K up rows: kq256_rows is bit-exact against ggml's per-token dot here (poly_cpu_kernel_parity).
+    // The IQ4_NL down rows have an AVX-2/VNNI row kernel too, but it is NOT bit-exact (it rounds differently alone
+    // than in a group - native_expert.cpp's #152 note; the tree's own parity holds it to rel <= 1e-5 against ggml),
+    // so the down rows keep ggml's vec_dot and the ids stay bit-identical.
+    const bool fast = kernels && gu_type == (int) GGML_TYPE_Q4_K && n_embd % 256 == 0;
+    if (fast) {
+        static std::once_flag said;
+        std::call_once(said, [] {
+            std::fprintf(stderr, "strata-poly: CPU expert row kernels: Q4_K up rows (bit-exact); down rows stay "
+                                 "ggml's vec_dot (the IQ4_NL row kernel is not bit-exact)\n");
+        });
+    }
 
     // The workers get these through the pointers below: a thread_local named in their code would be their own.
     static thread_local std::vector<uint8_t> act, hq;
@@ -222,6 +251,28 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         const CpuExpert& e = experts[byp[i0]];
         const bool gated = e.gate != nullptr;   // a latent MoE's experts have no gate
         const int r0 = (t % gu_tasks) * kRowsPerTask, r1 = std::min(n_ff, r0 + kRowsPerTask);
+        if (fast && !gated) {
+            // the run's up rows in one multi-token kernel: the expert's weights decode once for every use of it
+            const int nu = i1 - i0;
+            static thread_local std::vector<const void*> aptr;
+            static thread_local std::vector<float*> fptr;
+            aptr.resize((size_t) nu);
+            fptr.resize((size_t) nu);
+            for (int i = 0; i < nu; ++i) {
+                const int j = byp[i0 + i];
+                aptr[(size_t) i] = actp + (size_t) experts[j].row * a_bytes;
+                fptr[(size_t) i] = hp + (size_t) j * n_ff;
+            }
+            strata::kernels::cpu::kq256_rows((int) gu_type, e.up, gu_row, n_embd, aptr.data(), nu, fptr.data(), r0, r1);
+            for (int i = 0; i < nu; ++i) {   // no gate: relu2 of up (llama.cpp's LLM_FFN_RELU_SQR), and no clamp
+                float* row = fptr[(size_t) i];
+                for (int r = r0; r < r1; ++r) {
+                    const float v = row[r] > 0.f ? row[r] : 0.f;
+                    row[r] = v * v;
+                }
+            }
+            return;
+        }
         for (int r = r0; r < r1; ++r) {
             const uint8_t* gate = gated ? e.gate + (size_t) r * gu_row : nullptr;
             const uint8_t* up = e.up + (size_t) r * gu_row;

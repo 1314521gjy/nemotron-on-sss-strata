@@ -1510,10 +1510,24 @@ void Engine::load(const Options& o) {
         std::fprintf(stderr, "strata-poly: --pcie-auto: the share fitting is not in this build; only --pcie-frac is "
                              "read\n");
     if (opt_.dump || std::min(opt_.prompt_batch, opt_.max_context) == 1) opt_.window = 1;
+    // STRATA_DRAFT_LOAD_ONLY=1: for telling a draft block's VRAM cost from what it computes.  The block is still
+    // detected, loaded and wired (its weights, its cache and the state_/r_ buffers keep their VRAM), but nothing is
+    // computed from it and no guess is proposed: the run's numbers are the ones without a draft block, its VRAM the
+    // ones with it.  Off unless the variable says 1, so default runs are unchanged.
+    draft_load_only_ = [] {
+        const char* e = std::getenv("STRATA_DRAFT_LOAD_ONLY");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
     gg_ = std::make_unique<Shards>(opt_.model);
     if (!opt_.draft_model.empty() && opt_.draft && opt_.window != 1) dg_ = std::make_unique<Shards>(opt_.draft_model);
     load_geometry();
     if (block_ != dg_.get()) dg_.reset();
+    // the switch says what it did, so a run can be told from one that did not see it at all
+    if (draft_load_only_)
+        std::fprintf(stderr, "strata-poly: STRATA_DRAFT_LOAD_ONLY=1: %s\n",
+                     drafting() ? "the block that guesses ahead is loaded and its VRAM kept, but nothing is computed "
+                                  "or guessed from it"
+                                : "this model has no block that guesses ahead; nothing changes");
     hi_ = end_ < 0 ? n_layer_ : end_;
 
     cudaStream_t st = nullptr;
@@ -3409,10 +3423,10 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
         return;
     }
     // The model's output: the last token's for the logits, and every token's for the draft block.
-    if (want_logits || draft_) {
+    if (want_logits || drafting()) {
         const bool replay = opt_.graphs && n == 1 && want_logits && !opt_.dump;
-        const int m = draft_ ? n : 1;
-        float* h = draft_ ? hn_ + n_embd_ : xn_;
+        const int m = drafting() ? n : 1;
+        float* h = drafting() ? hn_ + n_embd_ : xn_;
         const auto tail = [&] {
             output_rows(n - m, m, h);
             dbg("out_norm", n_layer_, h, n_embd_);
@@ -3432,7 +3446,7 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
         if (want_logits) ck(cudaStreamSynchronize(cs(st_)), "eval");
     }
     // behind the logits: the caller has them while the card does this
-    if (draft_) draft_rows(tokens, ahead_pos_ == pos_ && tokens[0] == ahead_tok_ ? 1 : 0, n);
+    if (drafting()) draft_rows(tokens, ahead_pos_ == pos_ && tokens[0] == ahead_tok_ ? 1 : 0, n);
     pos_ += n;
     stats_.tokens += n;
 }
@@ -3579,7 +3593,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         fetch(1);
     }
     // a turn for each layer, and one for the model's output, which the draft block keeps a row of
-    const int turns = hi_ - lo_ + (draft_ ? 1 : 0);
+    const int turns = hi_ - lo_ + (drafting() ? 1 : 0);
     shared_ahead_ = true;
     try {
         for (int k = 0; k < turns; ++k) {
@@ -3707,7 +3721,7 @@ void Engine::window(const int32_t* tokens, int t) {
         next_->window(tokens, t);
         return;
     }
-    float* h = draft_ ? hn_ + n_embd_ : xn_;
+    float* h = drafting() ? hn_ + n_embd_ : xn_;
     output_rows(0, t, h);
     lin(output_, h, wlogits_, t);
     finish_logits(wlogits_, t);
@@ -3773,7 +3787,7 @@ void Engine::keep(int n) {
             pos_ -= from;
         }
     }
-    if (draft_) draft_rows(win_tok_, ahead_pos_ == pos_ && win_tok_[0] == ahead_tok_ ? 1 : 0, n);
+    if (drafting()) draft_rows(win_tok_, ahead_pos_ == pos_ && win_tok_[0] == ahead_tok_ ? 1 : 0, n);
     if (next_) next_->keep(n);
     pos_ += n;
     stats_.tokens += n;
@@ -3853,6 +3867,8 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
     if (next_) return next_->draft(token, i, prob);   // the last card has the draft block
     OnCard here(device_, split_);
     if (!draft_) throw std::logic_error("draft: this model has no block that guesses ahead");
+    if (draft_load_only_)   // STRATA_DRAFT_LOAD_ONLY=1: the block's VRAM is there, its guesses are not
+        throw std::logic_error("draft: STRATA_DRAFT_LOAD_ONLY=1 loads the block but does not draft from it");
     if (token < 0 || token >= n_vocab_) throw std::runtime_error("a token id is outside the vocabulary");
     if (i < 0 || pos_ + i >= opt_.max_context) throw std::logic_error("draft: the position is outside the context");
     cover(pos_ + i + 1);
