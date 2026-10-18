@@ -312,6 +312,17 @@ struct Session {
     // Compile #2: the same for the split's counters and for the CPU's own share of the expert phase
     double at_decode_cpu_busy_ms = 0;
     int64_t at_decode_pcie_experts = 0, at_decode_pcie_dmas = 0, at_decode_pcie_direct = 0;
+    // R49: the ledger's decode-only snapshots (route wait, pcie wait, and the CPU pool's three phases)
+    double at_decode_route_wait_ms = 0, at_decode_pcie_wait_ms = 0;
+    double at_decode_pool_gate_up_ms = 0, at_decode_pool_quant_ms = 0, at_decode_pool_down_ms = 0;
+    // R51: the directly measured segments and the ReLU^2 probe's counts, snapshotted at the same point
+    double at_decode_launch_ms = 0, at_decode_commit_ms = 0;
+    long long at_decode_probe_values = 0, at_decode_probe_zeros = 0, at_decode_probe_blocks = 0,
+              at_decode_probe_blocks_zero = 0, at_decode_probe_lines = 0, at_decode_probe_lines_zero = 0;
+    // R56 (Stage B): the sidecar probe's counters at the same decode-start snapshot, so its summary is the answer's
+    // uses only - the same window STRATA_PROBE_RELU2's deltas are read in.
+    long long at_decode_r2d_uses = 0, at_decode_r2d_active = 0, at_decode_r2d_active_q8 = 0,
+              at_decode_r2d_groups = 0, at_decode_r2d_bytes = 0;
     size_t at_decode_pcie_dma_bytes = 0;
     long long asked = 0, reused = 0;   // prompt tokens of every request, and those of them not read again
     // Guesses at the tokens to come, checked a window at a time (Engine::window).  They come from the block some
@@ -321,6 +332,10 @@ struct Session {
     int most;                             // the tokens of a window at most; 1: no guesses
     bool look;                            // guess from repeats
     int draft_dump = 0;                   // --draft-dump: print the first this many rounds' guesses vs the picks
+    // R49: the answer's round ledger (rounds, offered/accepted drafts, the windows' T histogram), printed with the
+    // four clocks at the end of an answer.
+    int64_t dec_rounds = 0, dec_offered = 0, dec_accepted = 0;
+    int64_t dec_hist[strata::spec::DraftPolicy::kMaxT + 1] = {};
     strata::spec::SuffixDrafter repeats;
     strata::spec::DraftPolicy policy;
     Guesses guesses;                      // whether the block is asked in a round, and for how many (guesses.hpp)
@@ -336,6 +351,10 @@ struct Session {
         if (dw != nullptr && std::atoi(dw) == 1)
             std::fprintf(stderr, "strata-poly: deterministic window: fixed depth=%d, gate=always\n",
                          std::min(most, kBlockWindow) - 1);
+        // R49: the four-segment decode ledger is on unless STRATA_DEC_LEDGER=0; this line proves the build has it.
+        const char* dl = std::getenv("STRATA_DEC_LEDGER");
+        if (dl == nullptr || std::atoi(dl) != 0)
+            std::fprintf(stderr, "strata-poly: profile: 4-segment ledger on\n");
     }
 
     static CacheOptions with_floor(const CacheFlags& f) {
@@ -372,6 +391,10 @@ struct Session {
         reused += r.resume;
         on_progress(r.resume, n, 0.0, true);
         if (s.seed != 0) rng.seed(s.seed);
+        // STRATA_PROMPT_BORROW: the prompt path's staging buffers are lent the expert cache's tail while a prompt
+        // is read (32 is the most tokens a call takes without the batched prompt path); the experts they stand in
+        // for are refilled before the answer's first token, below.  Nothing happens unless the switch is on.
+        if (n - 1 - r.resume >= 32) engine.prompt_borrow_begin();
 
         // The last token goes in alone, for the logits that come with it.  The tokens before it go in as many at
         // a time as the engine takes.  A prompt without pictures goes in several calls' worth at once, which the
@@ -420,6 +443,7 @@ struct Session {
             }
         }
         kept.prompt_was(n);
+        engine.prompt_borrow_end();   // STRATA_PROMPT_BORROW: the lent slots' experts go back; its time is prompt time
         r.prompt_ms = ms_since(t0);
         if (std::strcmp(r.finish, "cancel") == 0) return r;
         {
@@ -432,6 +456,24 @@ struct Session {
             at_decode_pcie_dmas = at_decode.pcie_dmas;
             at_decode_pcie_direct = at_decode.pcie_direct;
             at_decode_pcie_dma_bytes = at_decode.pcie_dma_bytes;
+            at_decode_route_wait_ms = at_decode.route_wait_ms;
+            at_decode_pcie_wait_ms = at_decode.pcie_wait_ms;
+            at_decode_pool_gate_up_ms = at_decode.pool_gate_up_ms;
+            at_decode_pool_quant_ms = at_decode.pool_quant_ms;
+            at_decode_pool_down_ms = at_decode.pool_down_ms;
+            at_decode_launch_ms = at_decode.launch_ms;
+            at_decode_commit_ms = at_decode.commit_ms;
+            at_decode_probe_values = at_decode.probe_values;
+            at_decode_probe_zeros = at_decode.probe_zeros;
+            at_decode_probe_blocks = at_decode.probe_blocks;
+            at_decode_probe_blocks_zero = at_decode.probe_blocks_zero;
+            at_decode_probe_lines = at_decode.probe_lines;
+            at_decode_probe_lines_zero = at_decode.probe_lines_zero;
+            at_decode_r2d_uses = at_decode.r2d_uses;
+            at_decode_r2d_active = at_decode.r2d_active;
+            at_decode_r2d_active_q8 = at_decode.r2d_active_q8;
+            at_decode_r2d_groups = at_decode.r2d_groups;
+            at_decode_r2d_bytes = at_decode.r2d_bytes;
         }
 
         t0 = Clock::now();
@@ -482,6 +524,7 @@ struct Session {
                     return guesses.end(in, n, ms_since(round), engine.took_record());
                 };
                 strata::spec::DraftPolicy::Pick use = policy.choose(1, k, match);
+                int round_drafts = 0;   // R49: the round's asked guesses, for the ledger
                 if (ask) {
                     int n_d = 0;
                     for (int32_t from = t; n_d < std::min(most, kBlockWindow) - 1 && guesses.wants(n_d); from = d[n_d++]) {
@@ -490,6 +533,7 @@ struct Session {
                         d[n_d] = engine.draft(from, n_d, &p);
                         if (!guesses.takes(n_d, p, ms_since(asked_at))) break;
                     }
+                    round_drafts = n_d;
                     use = policy.choose(1 + n_d, k, match);
                     if (guesses.deterministic()) {   // fixed depth: use every guess the chain produced
                         use.t = 1 + n_d;
@@ -505,6 +549,10 @@ struct Session {
                         std::fprintf(stderr, "\n");
                     }
                 }
+                ++dec_rounds;
+                dec_offered += round_drafts;
+                dec_accepted += (use.t > 1 ? use.t - 1 : 0);
+                dec_hist[std::min<int>(use.t, strata::spec::DraftPolicy::kMaxT)] += 1;
                 if (use.t == 1) {
                     if (dump_now) {
                         std::fprintf(stderr, "draft %d picked: (a guess was asked and not used)\n", dump_round);
@@ -789,6 +837,25 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
                  (unsigned long long) ss.engine.fill_dmas(), (double) ss.engine.fill_dma_bytes() / (1 << 20),
                  (unsigned long long) ss.engine.pin_dmas(), (double) ss.engine.pin_dma_bytes() / (double) (1 << 30),
                  (unsigned long long) ss.engine.swap_dmas(), (double) ss.engine.swap_dma_bytes() / (double) (1 << 30));
+    // R56 (Stage B): STRATA_RELU2_DOWN=1's read-only probe over the answer's CPU expert uses: the live-neuron index
+    // built from h after relu2, and the sidecar bytes a Stage C kernel would read for those uses (values: 512 B a
+    // live neuron; scales: 2048 B a 32-neuron IQ4_NL block that has one).  The compute path never read the sidecar.
+    if (ss.engine.relu2_down_on() && st.r2d_uses - ss.at_decode_r2d_uses > 0) {
+        const long long uses = st.r2d_uses - ss.at_decode_r2d_uses;
+        const long long act = st.r2d_active - ss.at_decode_r2d_active;
+        const long long act_q8 = st.r2d_active_q8 - ss.at_decode_r2d_active_q8;
+        const long long grp = st.r2d_groups - ss.at_decode_r2d_groups;
+        const long long bytes = st.r2d_bytes - ss.at_decode_r2d_bytes;
+        const double u = (double) uses;
+        const double nff = (double) ss.engine.expert_ff();
+        const double full = 1548288.0;   // one expert's down bytes in the GGUF (= the sidecar block)
+        std::fprintf(stderr,
+                     "relu2-down-summary: sidecar on, uses=%lld, active_avg=%.2f/%.0f (%.2f%%), q8_active_avg=%.2f, "
+                     "q8_active_ratio=%.2f%%, groups_avg=%.2f/%d, bytes_per_use=%.1f KB vs %.1f KB = %.2f%%\n",
+                     uses, (double) act / u, nff, 100.0 * (double) act / u / nff, (double) act_q8 / u,
+                     100.0 * (double) act_q8 / u / nff, (double) grp / u, (int) (nff / 32),
+                     (double) bytes / u / 1000.0, full / 1000.0, 100.0 * (double) bytes / u / full);
+    }
     // Compile #1/#2's instrument for the decode split: the answer's own misses per token, the CPU's microseconds
     // per miss, and - on the next line - the CPU's own share of that phase (cpu_busy, leaving out the hand-over to
     // the card and the split's copies), plus what the split moved.  The counters are the ones the prompt's read
@@ -808,6 +875,63 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
                  d_miss > 0 ? 1000.0 * d_busy_ms / (double) d_miss : 0.0,
                  d_miss > 0 ? 1000.0 * d_cpu_ms / (double) d_miss : 0.0, (double) d_pcie / (double) d_tok,
                  (long long) d_pcie_dmas, d_pcie_gb, (long long) d_pcie_direct);
+    // R49: the answer's four clocks and its round ledger, one line, the fields named as the teacher's q38_perf line
+    // names them, so the two can be read side by side.  STRATA_DEC_LEDGER=0 silences it; it prints only.
+    static const bool dec_ledger = [] {
+        const char* e = std::getenv("STRATA_DEC_LEDGER");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    if (dec_ledger) {
+        const double wall = r.decode_ms;   // the answer's decoding, ms
+        const double router = st.route_wait_ms - ss.at_decode_route_wait_ms;
+        const double pool = st.cpu_busy_ms - ss.at_decode_cpu_busy_ms;
+        const double host = (st.cpu_ms - ss.at_decode_cpu_ms) - pool;
+        const double gate_up = st.pool_gate_up_ms - ss.at_decode_pool_gate_up_ms;
+        const double quant = st.pool_quant_ms - ss.at_decode_pool_quant_ms;
+        const double down = st.pool_down_ms - ss.at_decode_pool_down_ms;
+        const double gbs = pool > 0 ? (double) d_miss * 2.9531 / pool : 0.0;   // 2.9531 MB an expert use
+        const double sum = router + pool + host;
+        const double commit = std::max(0.0, wall - sum);
+        char hist[128] = {};
+        int at = 0;
+        for (int t = 1; t <= strata::spec::DraftPolicy::kMaxT; ++t)
+            at += std::snprintf(hist + at, sizeof hist - (size_t) at, "%s%lld", t > 1 ? "," : "",
+                                (long long) ss.dec_hist[t]);
+        std::fprintf(stderr,
+                     "ledger: router_wait=%.1f cpu_pool=%.1f (gate/up=%.1f quant=%.1f down=%.1f, %.1f GB/s) "
+                     "host/launch=%.1f commit=%.1f ms | sum/wall=%.2f | rounds=%lld offered=%lld accepted=%lld "
+                     "ms/round=%.1f tokens/round=%.2f hist=[%s] | pcie_us/miss=%.1f\n",
+                     router, pool, gate_up, quant, down, gbs, host, commit, wall > 0 ? sum / wall : 0.0,
+                     (long long) ss.dec_rounds, (long long) ss.dec_offered, (long long) ss.dec_accepted,
+                     ss.dec_rounds ? wall / (double) ss.dec_rounds : 0.0,
+                     ss.dec_rounds ? (double) (st.tokens - ss.at_decode_tokens) / (double) ss.dec_rounds : 0.0, hist,
+                     d_miss > 0 ? 1000.0 * (st.pcie_wait_ms - ss.at_decode_pcie_wait_ms) / (double) d_miss : 0.0);
+        // R51: the two segments measured directly beside the derived ones, the pool closure, and the probe line.
+        const double host_m = st.launch_ms - ss.at_decode_launch_ms;
+        const double commit_m = st.commit_ms - ss.at_decode_commit_ms;
+        const double phase_sum = gate_up + quant + down;
+        const double phase_net = phase_sum - host_m;
+        const auto rel = [](double a, double b) { return b > 0.0 ? (a - b) / b * 100.0 : 0.0; };
+        const auto bad = [](double p) { return p > 2.0 || p < -2.0; };
+        const double hd = rel(host_m, host), cd = rel(commit_m, commit), pd = rel(phase_net, pool);
+        std::fprintf(stderr,
+                     "ledger-measured: host/launch=%.1f (derived %.1f, %+.1f%%%s) commit=%.1f (derived %.1f, "
+                     "%+.1f%%%s) phase_sum=%.1f net=%.1f vs pool=%.1f (%+.1f%%%s)\n",
+                     host_m, host, hd, bad(hd) ? " MISMATCH" : "", commit_m, commit, cd, bad(cd) ? " MISMATCH" : "",
+                     phase_sum, phase_net, pool, pd, bad(pd) ? " MISMATCH" : "");
+        const long long pv = st.probe_values - ss.at_decode_probe_values;
+        if (pv > 0) {
+            const long long pz = st.probe_zeros - ss.at_decode_probe_zeros;
+            const long long pb = st.probe_blocks - ss.at_decode_probe_blocks;
+            const long long pbz = st.probe_blocks_zero - ss.at_decode_probe_blocks_zero;
+            const long long pl = st.probe_lines - ss.at_decode_probe_lines;
+            const long long plz = st.probe_lines_zero - ss.at_decode_probe_lines_zero;
+            std::fprintf(stderr, "probe: relu2 sparsity on - s=%.4f 32block_zero=%.4f 64Bline_zero=%.4f "
+                                 "(values=%lld blocks=%lld lines=%lld)\n",
+                         pv ? (double) pz / (double) pv : 0.0, pb ? (double) pbz / (double) pb : 0.0,
+                         pl ? (double) plz / (double) pl : 0.0, pv, pb, pl);
+        }
+    }
     return 0;
 }
 

@@ -1,5 +1,9 @@
 // src/poly/engine.cpp - see the header.  What every architecture shares: the files, the weights' way to VRAM, the
 // routed experts (the cache, the CPU, a prompt batch), the sequence's state, and the calls that feed tokens.
+// R56: windows.h comes in further down for the Stage B sidecar mapping; its min/max macros would break this file.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "engine.hpp"
 
 #include "deepseek4.hpp"
@@ -35,6 +39,13 @@
 #include <thread>
 #include <unordered_map>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
 #ifdef __linux__
 #include <sched.h>
 #include <unistd.h>
@@ -54,6 +65,11 @@ constexpr int kClasses = (int) (sizeof(kTile) / sizeof(kTile[0])) + 1;
 // only this many rows instead of rows_ * n_used_; the experts run a batch at a time, each batch a run of experts
 // whose rows lie one interval [r0, r0 + rows).  8192 rows is a few hundred MiB at this model's expert widths.
 constexpr size_t kScratchRows = 8192;
+
+// STRATA_PROMPT_BORROW: the most of the expert cache's tail slots the prompt path may be lent, and the VRAM a run
+// keeps free whatever it lends (the desktop's, as R21 keeps it): a lend beyond either is refused loudly.
+constexpr int kBorrowMaxSlots = 2048;
+constexpr int kBorrowMinFreeMib = 1024;
 
 int tile_class(int rows) {
     int c = 0;
@@ -372,7 +388,259 @@ struct Engine::Swap {
 
 Engine::Engine() = default;
 
+namespace {
+
+// R56 (Stage B): the current process's working set, through psapi.dll dynamically (no link dependency on psapi.lib).
+struct ProcMem {
+    size_t ws = 0, peak = 0;
+};
+#ifdef _WIN32
+ProcMem process_memory() {
+    ProcMem r{};
+    struct Counters {
+        DWORD cb, PageFaultCount;
+        size_t PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage,
+            QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage;
+    };
+    using Fn = BOOL(WINAPI*)(HANDLE, void*, DWORD);
+    static Fn fn = [] {
+        HMODULE d = LoadLibraryA("psapi.dll");
+        return d ? (Fn) (void*) GetProcAddress(d, "GetProcessMemoryInfo") : (Fn) nullptr;
+    }();
+    Counters c{};
+    c.cb = sizeof c;
+    if (fn && fn(GetCurrentProcess(), &c, sizeof c)) {
+        r.ws = c.WorkingSetSize;
+        r.peak = c.PeakWorkingSetSize;
+    }
+    return r;
+}
+#else
+ProcMem process_memory() { return ProcMem{}; }
+#endif
+
+// R56 (Stage B): the inverse of Stage A's to_T for one expert's down block (the sidecar's Stage A code is
+// repack_down.py).  values n*512+b: low nibble -> down row 2b, high -> row 2b+1; scales g*2048+r*2: the fp16 scale
+// of IQ4_NL block g in row r.  out is the original d_bytes: n_out rows x (n_ff/32) blocks of 18 B.  On-load check
+// only; nothing in the compute path calls it.
+void relu2_from_T(const uint8_t* vals, const uint8_t* scales, int n_ff, size_t d_bytes, std::vector<uint8_t>& out) {
+    const int nb = n_ff / 32;                                  // 84 IQ4_NL blocks a row
+    const int n_out = (int) (d_bytes / ((size_t) nb * 18));    // 1024 output rows
+    out.assign(d_bytes, 0);
+    const int vals_per_neuron = n_out / 2;                     // 512 B: rows 2b (low) and 2b+1 (high)
+    for (int n = 0; n < n_ff; ++n) {
+        const int k = n / 32, m = n % 32;
+        const int j = m < 16 ? m : m - 16;
+        const int sh = m < 16 ? 0 : 4;
+        const uint8_t* v = vals + (size_t) n * (size_t) vals_per_neuron;
+        for (int b = 0; b < vals_per_neuron; ++b) {
+            const uint8_t x = v[b];
+            out[(size_t) (2 * b) * nb * 18 + (size_t) k * 18 + 2 + j] |= (uint8_t) ((x & 15) << sh);
+            out[(size_t) (2 * b + 1) * nb * 18 + (size_t) k * 18 + 2 + j] |= (uint8_t) ((x >> 4) << sh);
+        }
+    }
+    for (int g = 0; g < nb; ++g)
+        for (int r = 0; r < n_out; ++r)
+            for (int bb = 0; bb < 2; ++bb)
+                out[(size_t) r * nb * 18 + (size_t) g * 18 + bb] =
+                    scales[(size_t) g * n_out * 2 + (size_t) r * 2 + bb];
+}
+
+}  // namespace
+
+// R56 (Stage B): STRATA_RELU2_DOWN=1 maps the neuron-major down sidecar and checks it against the GGUF.  The
+// geometry must be the one Stage A packed (2688 neurons, 1024 rows, 512 experts, 40 main MoE layers).  The sidecar
+// is NOT pinned and not touched whole: only the four check experts' blocks are read (R53 §0.3: it is a second
+// 31.7 GB copy, and pinning it would put this box past its RAM).  Every failure is loud and turns the switch off:
+// the run then takes exactly the default path, which never reads this mapping.
+void Engine::relu2_down_open() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_RELU2_DOWN");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    if (!on) return;
+    auto unmap = [&] {
+#ifdef _WIN32
+        if (r2d_base_) UnmapViewOfFile((const void*) r2d_base_);
+        if (r2d_map_) CloseHandle((HANDLE) r2d_map_);
+        if (r2d_file_) CloseHandle((HANDLE) r2d_file_);
+#else
+        if (r2d_base_) ::munmap((void*) r2d_base_, r2d_bytes_);
+        if (r2d_file_) ::close((int) (intptr_t) r2d_file_);
+#endif
+        r2d_base_ = nullptr;
+        r2d_map_ = r2d_file_ = nullptr;
+    };
+    const auto refuse = [&](const std::string& why) {
+        std::fprintf(stderr, "strata-poly: STRATA_RELU2_DOWN=1 REFUSED: %s -- the default path runs (bit-identical)\n",
+                     why.c_str());
+        unmap();
+    };
+    if (n_expert_ != 512 || n_ff_exp_ != 2688) {
+        refuse("the model's experts are " + std::to_string(n_expert_) + " x " + std::to_string(n_ff_exp_) +
+               ", the sidecar's are 512 x 2688");
+        return;
+    }
+    // the main model's MoE layers, all on this engine (one card), in load order: only they are in the sidecar
+    int n_main_moe = 0;
+    size_t expert_bytes = 0;
+    for (int il = 0; il < (int) layers_.size() && il < n_layer_; ++il) {
+        const Layer& L = layers_[(size_t) il];
+        if (!L.moe) continue;
+        if (L.d_bytes == 0) { refuse("layer " + std::to_string(il) + " has no down"); return; }
+        if (expert_bytes == 0) expert_bytes = L.d_bytes;
+        if (L.d_bytes != expert_bytes) { refuse("layers disagree on an expert's down bytes"); return; }
+        ++n_main_moe;
+    }
+    if (n_main_moe != 40) {
+        refuse(std::to_string(n_main_moe) + " main MoE layers on this engine, the sidecar has 40 (one card only)");
+        return;
+    }
+    const size_t row_bytes = (size_t) (n_ff_exp_ / 32) * 18;   // 1512 B: one down row
+    if (expert_bytes != row_bytes * 1024) {
+        refuse("down's bytes per expert are " + std::to_string(expert_bytes) + ", expected 1024 x " +
+               std::to_string(row_bytes));
+        return;
+    }
+    const std::string path = [] {
+        const char* e = std::getenv("STRATA_RELU2_DOWN_PATH");
+        return std::string(e && e[0] ? e : "E:\\sp3-sidecar\\downT.bin");
+    }();
+    const size_t expect = (size_t) n_main_moe * (size_t) n_expert_ * expert_bytes;
+    const ProcMem mem0 = process_memory();
+    const size_t ram0 = ram_available();
+    const Clock::time_point t0 = Clock::now();
+    void* view = nullptr;
+#ifdef _WIN32
+    HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) {
+        refuse(path + ": CreateFile failed (" + std::to_string((long long) GetLastError()) + ")");
+        return;
+    }
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(fh, &sz) || (size_t) sz.QuadPart != expect) {
+        const long long got = (long long) sz.QuadPart;
+        CloseHandle(fh);
+        refuse(path + ": " + std::to_string(got) + " B, expected " + std::to_string(expect));
+        return;
+    }
+    HANDLE mh = CreateFileMappingA(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    view = mh ? MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0) : nullptr;
+    if (!view) {
+        if (mh) CloseHandle(mh);
+        CloseHandle(fh);
+        refuse(path + ": MapViewOfFile failed (" + std::to_string((long long) GetLastError()) + ")");
+        return;
+    }
+    r2d_file_ = fh;
+    r2d_map_ = mh;
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    struct stat st{};
+    if (fd < 0 || ::fstat(fd, &st) != 0 || (size_t) st.st_size != expect) {
+        const long long got = fd >= 0 ? (long long) st.st_size : -1;
+        if (fd >= 0) ::close(fd);
+        refuse(path + ": " + std::to_string(got) + " B, expected " + std::to_string(expect));
+        return;
+    }
+    view = ::mmap(nullptr, expect, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (view == MAP_FAILED) {
+        ::close(fd);
+        refuse(path + ": mmap failed");
+        return;
+    }
+    r2d_file_ = (void*) (intptr_t) fd;
+#endif
+    r2d_base_ = (const uint8_t*) view;
+    r2d_bytes_ = expect;
+    r2d_expert_bytes_ = expert_bytes;
+    r2d_layer_off_.assign(layers_.size(), (size_t) -1);
+    size_t at = 0;
+    for (int il = 0; il < (int) layers_.size() && il < n_layer_; ++il) {
+        if (!layers_[(size_t) il].moe) continue;
+        r2d_layer_off_[(size_t) il] = at;
+        at += (size_t) n_expert_ * expert_bytes;
+    }
+    // the four check experts: the first and the last main MoE layer, each one's expert 0 and 511
+    int first_moe = -1, last_moe = -1;
+    for (int il = 0; il < n_layer_; ++il)
+        if (layers_[(size_t) il].moe) {
+            if (first_moe < 0) first_moe = il;
+            last_moe = il;
+        }
+    const int n_out = (int) (expert_bytes / row_bytes);              // 1024
+    const size_t vals_b = (size_t) n_ff_exp_ * (size_t) (n_out / 2);
+    std::vector<uint8_t> rebuilt;
+    int okv = 0, badv = 0;
+    size_t touched = 0;
+    for (const int il : {first_moe, last_moe}) {
+        const Layer& L = layers_[(size_t) il];
+        for (const int e : {0, n_expert_ - 1}) {
+            const uint8_t* base = r2d_base_ + r2d_layer_off_[(size_t) il] + (size_t) e * expert_bytes;
+            relu2_from_T(base, base + vals_b, n_ff_exp_, expert_bytes, rebuilt);
+            touched += expert_bytes;
+            if (std::memcmp(rebuilt.data(), L.exp_down + (size_t) e * L.d_bytes, L.d_bytes) == 0) ++okv;
+            else ++badv;
+        }
+    }
+    const ProcMem mem1 = process_memory();
+    if (badv != 0) {
+        refuse("the sidecar does not match the GGUF's down bytes");
+        return;
+    }
+    // R57 (Stage C, option B): pin the sidecar read-only, so the decode's down reads are RAM and not page faults.
+    // pin_expert_arena() pinned only the GGUF up half when this switch is on, so the pinned total is the same
+    // 59.06 GiB.  The lead's floor: the sidecar must fit with 8 GiB RAM to spare, or the run refuses loudly.
+    const size_t ram_pre = ram_available();
+    if (ram_pre < expect + ((size_t) 8 << 30)) {
+        std::fprintf(stderr,
+                     "strata-poly: relu2-down REFUSED to pin: %.1f GiB RAM free, needs sidecar %.1f + 8 GiB\n",
+                     (double) ram_pre / (double) (size_t(1) << 30), (double) expect / (double) (size_t(1) << 30));
+        refuse("not enough RAM to pin the sidecar with an 8 GiB floor");
+        return;
+    }
+    const cudaError_t pr = cudaHostRegister((void*) r2d_base_, r2d_bytes_, cudaHostRegisterReadOnly);
+    if (pr != cudaSuccess) {
+        cudaGetLastError();
+        refuse("sidecar cudaHostRegisterReadOnly failed: " + std::string(cudaGetErrorString(pr)));
+        return;
+    }
+    r2d_pinned_ = true;
+    const size_t ram_post = ram_available();
+    if (ram_post < ((size_t) 8 << 30)) {
+        cudaHostUnregister((void*) r2d_base_);
+        r2d_pinned_ = false;
+        refuse("less than 8 GiB RAM left after pinning the sidecar");
+        return;
+    }
+    std::fprintf(stderr,
+                 "strata-poly: relu2-down: sidecar PINNED (%.2f GiB), up pinned (%.2f GiB), avail %.1f GiB, "
+                 "mmap %.3f GiB, ON-LOAD CHECK %d/%d experts == GGUF (0 diff), touched %.1f MB, WS +%.1f MB, "
+                 "%.1f ms\n",
+                 (double) expect / (double) (size_t(1) << 30), (double) pin_bytes_ / (double) (size_t(1) << 30),
+                 (double) ram_post / (double) (size_t(1) << 30), (double) expect / (double) (size_t(1) << 30), okv,
+                 okv + badv, (double) touched / 1e6, (double) (mem1.ws - mem0.ws) / 1e6, ms_since(t0));
+}
+
 Engine::~Engine() {
+    // R56/R57: the Stage B sidecar mapping (and its option B pin); nothing else points into it.
+    if (r2d_base_) {
+        if (r2d_pinned_) {
+            cudaHostUnregister((void*) r2d_base_);
+            r2d_pinned_ = false;
+        }
+#ifdef _WIN32
+        UnmapViewOfFile((const void*) r2d_base_);
+        if (r2d_map_) CloseHandle((HANDLE) r2d_map_);
+        if (r2d_file_) CloseHandle((HANDLE) r2d_file_);
+#else
+        ::munmap((void*) r2d_base_, r2d_bytes_);
+        if (r2d_file_) ::close((int) (intptr_t) r2d_file_);
+#endif
+        r2d_base_ = nullptr;
+        r2d_map_ = r2d_file_ = nullptr;
+    }
     next_.reset();
     OnCard here(device_, split_);
     map_quit_.store(true);
@@ -396,6 +664,7 @@ Engine::~Engine() {
     for (void* p : dev_allocs_) cudaFree(p);
     for (Kv& k : kv_) vmm_free(k);
     vmm_free(arena_);
+    vmm_free(borrow_);   // STRATA_PROMPT_BORROW: the region the prompt's staging buffers were lent
     for (void* p : host_allocs_) cudaFreeHost(p);
     for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_in_[0], ev_in_[1], ev_out_[0], ev_out_[1],
                     ev_hr_, ev_krn_, ev_copy_, ev_pcie_})
@@ -617,6 +886,9 @@ void Engine::shrink_cache(size_t bytes) {
         for (int e = 0; e < n_expert_; ++e) {
             const uint8_t* s = L.slot[(size_t) e];
             if (!s) continue;
+            // STRATA_PROMPT_BORROW: an expert refilled into a borrowed slot is not in the arena, and the cache's
+            // cut is the arena's: leave it be (its slot stays where the refill put it).
+            if (s < exp_ || s >= exp_ + arena_.mapped) continue;
             if ((size_t) (s - exp_) + L.slot_bytes > end) past.push_back(held(il, e));
             else low[(size_t) L.trade].push_back(held(il, e));
         }
@@ -1014,6 +1286,14 @@ void Engine::pin_expert_arena() {
     const char* env = std::getenv("STRATA_PIN_ARENA_GIB");
     const double gib = env ? std::atof(env) : 0.0;
     if (gib <= 0) return;
+    // R57 (Stage C, option B): with STRATA_RELU2_DOWN=1 the pin budget is split - the GGUF up half stays pinned
+    // here (staging, fill and swap keep DMAing it directly), and relu2_down_open() pins the 29.53 GiB neuron-major
+    // down sidecar in its place, so the pinned total is the same 59.06 GiB.  With the switch off nothing changes:
+    // both halves are pinned exactly as before.
+    static const bool sidecar = [] {
+        const char* e = std::getenv("STRATA_RELU2_DOWN");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
     const size_t budget = (size_t) (gib * (double) (size_t(1) << 30));
     const size_t ram_before = ram_available();
     // The user's floor: keep every expert in memory.  A full 40-layer pin is 59.06 GiB (40 x 1.4766); with this
@@ -1032,7 +1312,7 @@ void Engine::pin_expert_arena() {
         Layer& L = layers_[il];
         if (!L.moe || !L.exp_up || !L.exp_down) continue;
         const size_t up_len = (size_t) n_expert_ * L.gu_stride;
-        const size_t dn_len = (size_t) n_expert_ * L.d_bytes;
+        const size_t dn_len = sidecar ? 0 : (size_t) n_expert_ * L.d_bytes;
         const size_t gt_len = L.exp_gate ? (size_t) n_expert_ * L.gu_stride : 0;
         if (used + up_len + dn_len + gt_len > budget) break;   // whole layers only
         bool good = true;
@@ -1047,7 +1327,7 @@ void Engine::pin_expert_arena() {
             if (r != cudaSuccess) { cudaGetLastError(); good = false; }
         };
         reg(L.exp_up, up_len, "up");
-        if (good) reg(L.exp_down, dn_len, "down");
+        if (good && !sidecar) reg(L.exp_down, dn_len, "down");
         if (good && L.exp_gate) reg(L.exp_gate, gt_len, "gate");
         if (!good) { ++bad; break; }   // the failed register was printed above; keep what succeeded
         pin_layer_[il] = 1;
@@ -1056,9 +1336,10 @@ void Engine::pin_expert_arena() {
     }
     pin_bytes_ = used;
     std::fprintf(stderr,
-                 "strata-poly: STRATA_PIN_ARENA_GIB=%.1f: pinned %d layers (%.2f GiB) of %zu, %d refused; "
+                 "strata-poly: STRATA_PIN_ARENA_GIB=%.1f%s: pinned %d layers (%.2f GiB) of %zu, %d refused; "
                  "RAM %.1f -> %.1f GiB free; took %.0f ms\n",
-                 gib, ok, (double) used / (double) (size_t(1) << 30), layers_.size(), bad,
+                 gib, sidecar ? " (option B: up half only; the sidecar is pinned in its place)" : "", ok,
+                 (double) used / (double) (size_t(1) << 30), layers_.size(), bad,
                  (double) ram_before / (double) (size_t(1) << 30),
                  (double) ram_available() / (double) (size_t(1) << 30), ms_since(t0));
 }
@@ -1083,7 +1364,35 @@ void Engine::fill_expert_cache() {
     reserve_mib_ = opt_.vram_reserve_mib >= 0 ? std::max(opt_.vram_reserve_mib, 256)
                                              : default_reserve_mib(total_b, ram_tight_);
     const size_t reserve = size_t(reserve_mib_) << 20;
-    if (free_b <= reserve) return;
+    // STRATA_PROMPT_BORROW: the cache is sized as it is when the prompt's staging buffers hold their VRAM (a run
+    // without the switch), so it holds the same experts in the same slots: take that VRAM for a moment, measure
+    // what one buffer costs, and give it back - the buffers are lent the cache's tail instead of holding their own.
+    if (borrow_lend_) {
+        if (stage_alloc_bytes_ == 0) {
+            borrow_lend_ = false;
+            std::fprintf(stderr, "strata-poly: STRATA_PROMPT_BORROW: no staging buffer to lend: nothing is lent\n");
+        } else {
+            const size_t before = free_b;
+            void* probe = nullptr;
+            if (cudaMalloc(&probe, stage_alloc_bytes_) != cudaSuccess) {
+                cudaGetLastError();
+                throw std::runtime_error("prompt borrow: the prompt's staging buffer (" +
+                                         std::to_string(stage_alloc_bytes_ >> 20) + " MiB) do not fit: " +
+                                         std::to_string(free_b >> 20) + " MiB of VRAM free, " +
+                                         std::to_string(reserve_mib_) + " MiB kept for what comes later");
+            }
+            ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+            cudaFree(probe);
+            borrow_one_buffer_ = before > free_b ? before - free_b : stage_alloc_bytes_;
+        }
+    }
+    if (free_b <= reserve) {
+        if (borrow_lend_)
+            throw std::runtime_error("prompt borrow: the prompt's staging buffer do not fit: " +
+                                     std::to_string(free_b >> 20) + " MiB of VRAM free and " +
+                                     std::to_string(reserve_mib_) + " MiB kept for what comes later");
+        return;
+    }
 
     struct Cand {
         int il, e;
@@ -1133,13 +1442,19 @@ void Engine::fill_expert_cache() {
         exp_ = (uint8_t*) dmalloc(arena + 256, "the expert cache");
     }
     ck(cudaMemset(exp_, 0, arena + 256), "the expert cache");   // the slots' tails stay zero (kTail)
+    // STRATA_PROMPT_BORROW: the region the staging buffers are lent is mapped here, before the experts fill the
+    // cache: it is the tail slots the cache is too small for, and a lend that does not fit fails loudly (C1).
+    if (borrow_lend_) map_prompt_borrow();
     // Which experts is by value; where they go is by layer, a layer's side by side in the experts' order.
     std::vector<Cand> taken;
+    std::vector<char> is_taken(cands.size(), 0);
     size_t room = arena;
-    for (const Cand& c : cands) {
+    for (size_t i = 0; i < cands.size(); ++i) {
+        const Cand& c = cands[i];
         if (c.bytes > room) continue;   // a smaller expert of another layer may still fit
         room -= c.bytes;
         taken.push_back(c);
+        is_taken[i] = 1;
     }
     std::sort(taken.begin(), taken.end(),
               [](const Cand& a, const Cand& b) { return a.il != b.il ? a.il < b.il : a.e < b.e; });
@@ -1163,6 +1478,200 @@ void Engine::fill_expert_cache() {
         full_bytes_ = arena;
         full_cached_ = cached_;
     }
+    if (borrow_lend_ && borrow_bytes_ > 0) {
+        // The experts the lent slots stand in for: the ones the cache would hold next, lowest rank first (a lent
+        // slot's expert streams during the prompt and is refilled after it).  Kept so the refill needs no second
+        // sizing pass and cannot pick a different set than the fill would have.
+        borrow_cands_.clear();
+        size_t hold = borrow_bytes_;
+        for (size_t i = 0; i < cands.size(); ++i) {
+            if (is_taken[i]) continue;
+            if (cands[i].bytes > hold) continue;
+            hold -= cands[i].bytes;
+            borrow_cands_.push_back({cands[i].il, cands[i].e, cands[i].bytes});
+        }
+        if (borrow_cands_.empty())
+            throw std::runtime_error("prompt borrow: the lent slots have no expert to stand in for (the cache is not "
+                                     "full)");
+    }
+    if (std::getenv("STRATA_PROMPT_BORROW_DEBUG"))
+        std::fprintf(stderr, "cache-debug: free_b=%zu MiB reserve=%zu MiB arena=%zu MiB arena_mapped=%zu MiB "
+                             "cached=%d exp_at=%zu MiB borrow=%zu MiB\n",
+                     free_b >> 20, reserve_mib_, arena >> 20, arena_.mapped >> 20, cached_, exp_at_ >> 20,
+                     borrow_bytes_ >> 20);
+}
+
+// STRATA_PROMPT_BORROW: the region the prompt's staging buffers are lent from the expert cache's tail.  It is a
+// mapping of its own - cover() and shrink_cache() only ever cut arena_ - and the cache was sized as if the buffers
+// held their own VRAM (fill_expert_cache()), so the region is exactly the slots the cache has no room for.  A lend
+// that does not fit is loud (C1): never a smaller one, never a cache built on top of the buffers.
+void Engine::map_prompt_borrow() {
+    const int buffers = ring2_ ? 2 : 1;
+    const size_t need = (size_t) buffers * borrow_one_buffer_;
+    size_t free_b = 0, total_b = 0;
+    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    const size_t keep = size_t(kBorrowMinFreeMib) << 20;
+    const size_t cap_bytes = free_b > keep ? free_b - keep : 0;
+    const size_t cap_slots = std::min<size_t>((size_t) kBorrowMaxSlots, cap_bytes / std::max<size_t>(slot_max_, 1));
+    size_t want = need;
+    if (borrow_slots_req_ > 0) {   // STRATA_PROMPT_BORROW_SLOTS: force the lend (an A/B and the conflict check)
+        want = (size_t) borrow_slots_req_ * slot_max_;
+        if (want < need)
+            throw std::runtime_error("prompt borrow: " + std::to_string(borrow_slots_req_) + " slots (" +
+                                     std::to_string(want >> 20) + " MiB) do not fit the prompt's " +
+                                     std::to_string(buffers) + " staging buffer(s) (" + std::to_string(need >> 20) +
+                                     " MiB)");
+        if (want > cap_bytes)
+            throw std::runtime_error("prompt borrow: " + std::to_string(borrow_slots_req_) + " slots (" +
+                                     std::to_string(want >> 20) + " MiB) do not fit: the cache can lend " +
+                                     std::to_string(cap_slots) + " slots (" + std::to_string(cap_bytes >> 20) +
+                                     " MiB) and " + std::to_string(kBorrowMinFreeMib) + " MiB stay free");
+    }
+    if (want > cap_bytes) {   // auto: what the buffers need; a second buffer that does not fit holds its own
+        if (buffers > 1 && borrow_one_buffer_ <= cap_bytes) {
+            std::fprintf(stderr, "strata-poly: STRATA_PROMPT_BORROW: %.0f MiB can be lent: one staging buffer is lent, "
+                                 "the second holds its own VRAM\n", (double) (cap_bytes >> 20));
+            want = borrow_one_buffer_;
+        } else {
+            throw std::runtime_error("prompt borrow: the prompt's staging buffer(s) (" + std::to_string(need >> 20) +
+                                     " MiB) do not fit: " + std::to_string(cap_bytes >> 20) + " MiB can be lent and " +
+                                     std::to_string(kBorrowMinFreeMib) + " MiB stay free");
+        }
+    }
+    vmm_reserve(borrow_, want + 256);
+    vmm_map(borrow_, want, kArenaPiece, "the borrowed prompt buffers");
+    ck(cudaMemset((void*) borrow_.base, 0, want), "the borrowed prompt buffers");
+    borrow_bytes_ = want;
+    borrow_buffers_ = (int) std::min<size_t>((size_t) buffers, want / std::max<size_t>(borrow_one_buffer_, 1));
+    borrow_off_[0] = 0;
+    borrow_off_[1] = borrow_one_buffer_;
+    if (std::getenv("STRATA_PROMPT_BORROW_DEBUG"))
+        std::fprintf(stderr,
+                     "borrow-debug: free=%zu MiB keep=%zu MiB cap=%zu MiB cap_slots=%zu need=%zu MiB want=%zu MiB "
+                     "buffers=%d one_buffer=%.2f MiB region_slots=%zu arena=%zu MiB cached=%d\n",
+                     free_b >> 20, keep >> 20, cap_bytes >> 20, cap_slots, need >> 20, want >> 20, borrow_buffers_,
+                     (double) borrow_one_buffer_ / (1024.0 * 1024.0), want / std::max<size_t>(slot_max_, 1),
+                     arena_.mapped >> 20, cached_);
+}
+
+// STRATA_PROMPT_BORROW: a prompt is about to be read and its buffers are written into the lent region.  The experts
+// refilled there by the answer before go out again first: their slots are the buffers' bytes now.
+void Engine::prompt_borrow_begin() {
+    if (!borrow_lend_ || borrow_bytes_ == 0 || prompt_lent_) return;
+    if (borrow_lent_ > 0) {
+        for (const Lent& c : borrow_cands_) {
+            Layer& L = layers_[(size_t) c.il];
+            if (L.slot[(size_t) c.e] != nullptr) {
+                L.slot[(size_t) c.e] = nullptr;
+                --cached_;
+            }
+        }
+        borrow_lent_ = 0;
+    }
+    prompt_lent_ = true;
+}
+
+// STRATA_PROMPT_BORROW: the prompt is read and done with its buffers: put the experts they stand in for back, so the
+// answer is written from the whole cache.  Its cost is prompt time (the caller times the prompt around it).
+void Engine::prompt_borrow_end() {
+    if (!prompt_lent_) return;
+    prompt_lent_ = false;
+    if (borrow_bytes_ == 0) return;
+    // the prompt's last copies and kernels must be done with the region before it holds experts again
+    ck(cudaStreamSynchronize(cs(st_)), "prompt borrow");
+    if (up_) ck(cudaStreamSynchronize(cs(up_)), "prompt borrow");
+    if (cp_) ck(cudaStreamSynchronize(cs(cp_)), "prompt borrow");
+    if (!borrow_refill_) {
+        std::fprintf(stderr, "borrow: lent %d slots (%.1f MB), refill 0.0 ms (STRATA_PROMPT_BORROW_REFILL=0: nothing "
+                             "put back, the cache is the one without the switch)\n",
+                     (int) (borrow_bytes_ / std::max<size_t>(slot_max_, 1)), (double) (borrow_bytes_ >> 20));
+        return;
+    }
+    refill_prompt_borrow();
+}
+
+// STRATA_PROMPT_BORROW: the experts the lent slots stand in for, back into the region side by side by layer as
+// fill_expert_cache() laid the cached ones.  The region is zeroed first (the kernels read up to kTail past a matrix);
+// the time is measured and printed with the lend, and a slot that does not hold its expert is loud (verify).
+void Engine::refill_prompt_borrow() {
+    const Clock::time_point t0 = Clock::now();
+    ck(cudaMemsetAsync((void*) borrow_.base, 0, borrow_bytes_, cs(st_)), "the borrowed prompt buffers");
+    std::vector<Lent> took;
+    took.reserve(borrow_cands_.size());
+    size_t room = borrow_bytes_;
+    for (const Lent& c : borrow_cands_) {
+        if (c.bytes > room) continue;
+        room -= c.bytes;
+        took.push_back(c);
+    }
+    std::sort(took.begin(), took.end(),
+              [](const Lent& a, const Lent& b) { return a.il != b.il ? a.il < b.il : a.e < b.e; });
+    size_t at = 0, bytes = 0;
+    for (const Lent& c : took) {
+        Layer& L = layers_[(size_t) c.il];
+        uint8_t* const s = (uint8_t*) borrow_.base + at;
+        at += c.bytes;
+        bytes += c.bytes;
+        const size_t e = (size_t) c.e;
+        if (L.gated)
+            ck(cudaMemcpyAsync(s, L.exp_gate + e * L.gu_stride, L.gu_bytes, cudaMemcpyHostToDevice, cs(st_)),
+               "expert refill");
+        ck(cudaMemcpyAsync(s + L.slot_up(), L.exp_up + e * L.gu_stride, L.gu_bytes, cudaMemcpyHostToDevice, cs(st_)),
+           "expert refill");
+        ck(cudaMemcpyAsync(s + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice, cs(st_)),
+           "expert refill");
+        L.slot[e] = s;
+        ++cached_;
+    }
+    ck(cudaStreamSynchronize(cs(st_)), "prompt borrow refill");
+    borrow_lent_ = (int) took.size();
+    borrow_refill_ms_ = ms_since(t0);
+    borrow_refill_bytes_ = bytes;
+    std::fprintf(stderr, "borrow: lent %d slots (%.1f MB), refill %.1f ms (%zu experts, %.0f MB)\n",
+                 (int) (borrow_bytes_ / std::max<size_t>(slot_max_, 1)), (double) (borrow_bytes_ >> 20),
+                 borrow_refill_ms_, took.size(), (double) (bytes >> 20));
+    if (std::getenv("STRATA_PROMPT_BORROW_DEBUG"))
+        std::fprintf(stderr, "borrow-debug: refilled %zu experts (%zu MB) into %zu MiB, cached=%d, exp_at=%zu MB\n",
+                     took.size(), bytes >> 20, borrow_bytes_ >> 20, cached_, exp_at_ >> 20);
+    if (borrow_verify_ > 0) verify_prompt_borrow(took);
+}
+
+// STRATA_PROMPT_BORROW_CHECK: every refilled slot holds its expert byte for byte, and slots that were not lent are
+// untouched (the control).  A mismatch is loud: an answer written from that cache would be wrong.
+void Engine::verify_prompt_borrow(const std::vector<Lent>& took) {
+    const auto same = [](const Layer& L, int e, const uint8_t* slot) -> bool {
+        std::vector<uint8_t> buf(L.slot_bytes);
+        if (cudaMemcpy(buf.data(), slot, L.slot_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        const size_t es = (size_t) e;
+        if (L.gated && std::memcmp(buf.data(), L.exp_gate + es * L.gu_stride, L.gu_bytes) != 0) return false;
+        if (std::memcmp(buf.data() + L.slot_up(), L.exp_up + es * L.gu_stride, L.gu_bytes) != 0) return false;
+        if (std::memcmp(buf.data() + L.slot_down(), L.exp_down + es * L.d_bytes, L.d_bytes) != 0) return false;
+        return true;
+    };
+    int bad = 0, refilled_ok = 0, control_ok = 0, control = 0;
+    const size_t n = std::min<size_t>((size_t) borrow_verify_, took.size());
+    for (size_t i = 0; i < n; ++i) {
+        const Layer& L = layers_[(size_t) took[i].il];
+        if (same(L, took[i].e, L.slot[(size_t) took[i].e])) ++refilled_ok; else ++bad;
+    }
+    // the control: resident experts that were not lent (their slots lie in arena_, not in the borrowed region)
+    for (int il = 0; il < (int) layers_.size() && control < borrow_verify_; ++il) {
+        const Layer& L = layers_[(size_t) il];
+        if (!L.moe) continue;   // a layer without routed experts has no slots
+        for (int e = 0; e < n_expert_ && control < borrow_verify_; ++e) {
+            const uint8_t* const s = L.slot[(size_t) e];
+            if (s == nullptr || s < exp_ || s >= exp_ + arena_.mapped) continue;
+            if (same(L, e, s)) ++control_ok; else ++bad;
+            ++control;
+        }
+    }
+    std::fprintf(stderr, "borrow verify: refilled %d/%zu slots hold their expert, control %d/%d not-lent slots\n",
+                 refilled_ok, n, control_ok, control);
+    if (bad > 0)
+        throw std::runtime_error("prompt borrow: a slot does not hold its expert after the refill: the cache is wrong");
 }
 
 // The thread and the stream that bring experts into the cache while an answer is written (follow()).
@@ -1190,6 +1699,11 @@ void Engine::resize_cache(int mib) {
 
 void Engine::resize_card_cache(int mib) {
     if (!opt_.gpu_experts || n_moe_ == 0) return;
+    // STRATA_PROMPT_BORROW: the staging buffers are the cache's lent tail, so a cache sized again would have to
+    // take them back: it is refused loudly rather than leave the prompt path writing into a cache's slots.
+    if (borrow_bytes_ > 0)
+        throw std::runtime_error("resize_cache is not available with STRATA_PROMPT_BORROW: the prompt's staging "
+                                 "buffers are lent the expert cache's tail; start the engine without the switch");
     OnCard here(device_, split_);
     ck(cudaStreamSynchronize(cs(st_)), "resize");
     const auto failed = [&] {
@@ -1524,6 +2038,32 @@ void Engine::load(const Options& o) {
         const char* e = std::getenv("STRATA_DRAFT_LOAD_ONLY");
         return e && e[0] == '1' && e[1] == '\0';
     }();
+    // STRATA_PROMPT_BORROW: the prompt path's staging buffers come out of slots lent from the expert cache's tail
+    // instead of holding VRAM of their own all the time: the cache is sized as if they did hold it, the slots they
+    // stand in for stream during the prompt, and their experts are refilled after it - so the cache the answer is
+    // written from is the larger one.  Off unless the switch says 1 (then the past behaviour, byte for byte).
+    // STRATA_PROMPT_BORROW_SLOTS: the slots to lend (0 = none, an A/B; the default is what the buffers take).
+    // STRATA_PROMPT_BORROW_REFILL=0: lend, but put nothing back (an A/B of the refill's own cost).
+    // STRATA_PROMPT_BORROW_CHECK=n: check n refilled slots against the experts they stand for, and n that were
+    // not lent (an A/B of the refill's content; a mismatch is loud).
+    prompt_borrow_ = [] {
+        const char* e = std::getenv("STRATA_PROMPT_BORROW");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    if (const char* e = std::getenv("STRATA_PROMPT_BORROW_SLOTS")) {
+        const int v = std::atoi(e);
+        if (v < 0) throw std::runtime_error("STRATA_PROMPT_BORROW_SLOTS cannot be negative");
+        borrow_slots_req_ = v;
+    }
+    if (const char* e = std::getenv("STRATA_PROMPT_BORROW_REFILL")) borrow_refill_ = std::atoi(e) != 0;
+    if (const char* e = std::getenv("STRATA_PROMPT_BORROW_CHECK")) borrow_verify_ = std::atoi(e);
+    borrow_lend_ = prompt_borrow_ && borrow_slots_req_ != 0;
+    if (prompt_borrow_)
+        std::fprintf(stderr,
+                     "strata-poly: STRATA_PROMPT_BORROW=1: the prompt's staging buffers are lent the expert cache's "
+                     "tail%s\n",
+                     !borrow_lend_ ? "; STRATA_PROMPT_BORROW_SLOTS=0, none lent: they hold their own VRAM"
+                     : borrow_refill_ ? "" : "; STRATA_PROMPT_BORROW_REFILL=0, nothing is put back");
     gg_ = std::make_unique<Shards>(opt_.model);
     if (!opt_.draft_model.empty() && opt_.draft && opt_.window != 1) dg_ = std::make_unique<Shards>(opt_.draft_model);
     load_geometry();
@@ -1559,6 +2099,11 @@ void Engine::load(const Options& o) {
         prop.location.id = device_;
         vmm_ = cuMemGetAllocationGranularity(&grain_, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS &&
                grain_ > 0;
+    }
+    if (borrow_lend_ && !vmm_) {   // the region is a mapping of its own: a card without VMM has none to give
+        borrow_lend_ = false;
+        std::fprintf(stderr, "strata-poly: STRATA_PROMPT_BORROW: this card does not map VRAM a piece at a time: the "
+                             "switch stays off, the staging buffers hold their own VRAM\n");
     }
 
     // the token table stays in the file, a row a token, and embed() reads a row in whatever type it has
@@ -1609,14 +2154,41 @@ void Engine::load(const Options& o) {
     if (opt_.window == 0) opt_.window = recurrent_floats() == 0 || snaps_spread() ? 8 : 4;
     opt_.window = std::min({opt_.window, opt_.prompt_batch, opt_.max_context});
     alloc();
+    relu2_down_open();   // R56 Stage B: STRATA_RELU2_DOWN=1 maps the neuron-major down sidecar (read only, no pin)
     if (!opt_.profile.empty()) read_profile(opt_.profile, (int) layers_.size(), n_expert_, prior_);
     fill_expert_cache();
+    // STRATA_PROMPT_BORROW: the staging buffers the fill lent a region of the cache's tail are pointed at it now:
+    // stage_ at the region's first buffer, stage2_ at the second when the region holds both.  The switch says what
+    // it did, so a run can be told from one that did not see it.
+    if (borrow_lend_ && borrow_bytes_ == 0)
+        throw std::runtime_error("prompt borrow: the expert cache had no room to lend the prompt's staging buffers "
+                                 "(a smaller --prompt-batch or a smaller reserve is what changes that)");
+    if (borrow_lend_ && borrow_bytes_ > 0) {
+        stage_ = (uint8_t*) borrow_.base;
+        if (ring2_) slot_[0] = stage_;
+        if (ring2_ && borrow_buffers_ > 1) {
+            stage2_ = stage_ + borrow_off_[1];
+            slot_[1] = stage2_;
+        }
+        std::fprintf(stderr,
+                     "strata-poly: STRATA_PROMPT_BORROW: the prompt path's %d staging buffer(s) (%.0f MiB) are lent "
+                     "a region of %.0f MiB = %zu slots of the expert cache's tail; their experts are refilled after "
+                     "the prompt\n",
+                     borrow_buffers_, (double) (borrow_one_buffer_ >> 20), (double) (borrow_bytes_ >> 20),
+                     borrow_cands_.size());
+    }
+    // What a prompt batch costs in buffer bytes and tokens a call: the figures the borrow and the staging A/Bs are
+    // read against (STRATA_PROMPT_BORROW needs the workspace size it is meant to stand in for).
+    if (mmq_ && slot_max_ > 0)
+        std::fprintf(stderr, "strata-poly: prompt batch: %d tokens a call (%.0f MiB of staging = %d expert slots)%s\n",
+                     rows_, (double) (stage_bytes_ >> 20), (int) (stage_bytes_ / slot_max_),
+                     borrow_lend_ ? "; the staging buffers are borrowed from the expert cache" : "");
     // STRATA_STAGE_RING2: the second round buffer is made here, after the cache has been filled, so that the cache
     // is byte for byte the one the switch-off run gets (the buffer lives in the reserve's headroom).  A failure to
     // make it is loud and leaves the engine on the one-buffer path; it is never a silent short buffer.
-    if (ring2_) {
+    if (ring2_ && stage2_ == nullptr) {
         try {
-            stage2_ = (uint8_t*) dmalloc(stage_bytes_ + 256 + kTail, "the second expert staging buffer");
+            stage2_ = (uint8_t*) dmalloc(stage_alloc_bytes_, "the second expert staging buffer");
             slot_[1] = stage2_;
             std::fprintf(stderr, "strata-poly: STRATA_STAGE_RING2: the second round buffer is %.0f MiB, after the "
                                  "expert cache (%.0f MiB of it used for %d experts)\n",
@@ -1853,6 +2425,13 @@ void Engine::alloc() {
         one_expert = std::max(one_expert, L.slot_down() + L.d_bytes);
     }
     if (tiles) mmq_ = std::make_unique<Mmq>();
+    // STRATA_PROMPT_BORROW: a model whose prompt batches do not go through the staging buffer has nothing to lend
+    // (the buffers are only ever read by the batched prompt path); the switch says so rather than lend nothing.
+    if (borrow_lend_ && (!mmq_ || rows_ < kStageRows)) {
+        borrow_lend_ = false;
+        std::fprintf(stderr, "strata-poly: STRATA_PROMPT_BORROW: this model runs no batched prompt (no MMQ tile or a "
+                             "prompt batch under %d tokens): nothing is lent\n", kStageRows);
+    }
     if (opt_.pcie_frac > 0.0 && !mmq_)
         std::fprintf(stderr, "strata-poly: --pcie-frac %.3f: this card has no batched expert path (no MMQ tile for "
                              "the experts' types), so no staging slots are made\n", opt_.pcie_frac);
@@ -1915,7 +2494,10 @@ void Engine::alloc() {
         // expert cache of a small card does without.
         stage_bytes_ = std::max(std::min((size_t) opt_.stage_mib << 20, (size_t) n_expert_ * one_expert), one_expert);
         chunk_bytes_ = std::max(kChunkBytes, one_expert);
-        stage_ = (uint8_t*) dmalloc(stage_bytes_ + 256 + kTail, "the expert staging buffer");
+        stage_alloc_bytes_ = stage_bytes_ + 256 + kTail;   // what one staging buffer takes, the slack included
+        // STRATA_PROMPT_BORROW: the staging buffers hold no VRAM of their own; fill_expert_cache() maps them a
+        // region of the cache's tail and load() points them at it (after the cache is filled).
+        if (!borrow_lend_) stage_ = (uint8_t*) dmalloc(stage_alloc_bytes_, "the expert staging buffer");
         // --pcie-frac: the staging slots a share of an answer's misses is copied into, and the stream and event that
         // take them there.  Made here, before fill_expert_cache() reads the free VRAM, so they come out of the expert
         // cache's arena the way the split's copies will; with the switch at its default nothing is made and the run's
@@ -2265,8 +2847,10 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 }
                 host_e[n_host] = (int32_t) e;
                 host_k[n_host] = k;
+                const uint8_t* downT =
+                    r2d_base_ ? r2d_base_ + r2d_layer_off_[(size_t) il] + (size_t) e * r2d_expert_bytes_ : nullptr;
                 host[n_host++] = {L.gated ? L.exp_gate + e * L.gu_stride : nullptr, L.exp_up + e * L.gu_stride,
-                                  L.exp_down + e * L.d_bytes, w[k], t};
+                                  L.exp_down + e * L.d_bytes, w[k], t, downT};
             }
         }
         // Strata's STRATA_ROUTE_TAIL_SKIP: an expert outside VRAM that every token here ranks at tail_skip or later
@@ -2489,7 +3073,11 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             // kernel: the same native_mmvq* calls).  The wait is here, not before the cached loop, so the cached work
             // and the CPU's overlapped the copies.
             if (n_pcie > 0) {
-                if (!direct) ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_pcie_, 0), "PCIe staging");
+                if (!direct) {
+                    const Clock::time_point w0 = Clock::now();
+                    ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_pcie_, 0), "PCIe staging");
+                    stats_.pcie_wait_ms += ms_since(w0);   // R49: the ledger's real pcie_us/miss (0 at frac 0)
+                }
                 ScaledRows psum{};
                 for (int i0 = 0; i0 < n_pcie; i0 += per) {
                     const int m = std::min(per, n_pcie - i0);
@@ -2538,9 +3126,35 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         any_host = true;
         t0 = Clock::now();
         const bool hand_over = n_cached > 0 || n_pcie > 0 || (first && at == 0);
+        // R51: the ReLU^2 sparsity probe is read only; the flag is asked once per process.
+        static const bool probe_relu2 = [] {
+            const char* e = std::getenv("STRATA_PROBE_RELU2");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        Relu2Probe probe;
+        Relu2Active relu2;   // R56 Stage B: read only; built only when the sidecar is on
+        relu2.sidecar = r2d_base_ != nullptr;
         cpu_experts(*workers_, host, n_host, m, (int) L.gu_type, (int) L.d_type, in_w, n_ff_exp_,
-                    h_x_ + (size_t) at * e_row, limit, gelu_, cpu, out_w, hand_over ? &launch : nullptr);
+                    h_x_ + (size_t) at * e_row, limit, gelu_, cpu, out_w, hand_over ? &launch : nullptr,
+                    &stats_.pool_gate_up_ms, &stats_.pool_quant_ms, &stats_.pool_down_ms,
+                    probe_relu2 ? &probe : nullptr, r2d_base_ ? &relu2 : nullptr);
+        if (probe_relu2) {
+            stats_.probe_values += probe.values;
+            stats_.probe_zeros += probe.zeros;
+            stats_.probe_blocks += probe.blocks;
+            stats_.probe_blocks_zero += probe.blocks_zero;
+            stats_.probe_lines += probe.lines;
+            stats_.probe_lines_zero += probe.lines_zero;
+        }
+        if (r2d_base_) {
+            stats_.r2d_uses += relu2.uses;
+            stats_.r2d_active += relu2.active;
+            stats_.r2d_active_q8 += relu2.active_q8;
+            stats_.r2d_groups += relu2.groups;
+            stats_.r2d_bytes += relu2.bytes;
+        }
         const double wall = ms_since(t0);
+        stats_.launch_ms += launch_ms;   // R51: the launch segment measured where it runs, not derived from cpu_ms
         stats_.cpu_ms += wall;
         stats_.cpu_busy_ms += std::max(0.0, wall - launch_ms);
     }
@@ -2630,6 +3244,41 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
         const size_t c = (size_t) std::min(per, m - j0);
         if (pin) {
             ++pin_chunks_;
+            if (r2d_base_ != nullptr) {
+                // R57 (Stage C, option B): the up half is pinned here but the down half is not (the pin budget went
+                // to the sidecar), so the downs are gathered into the pinned staging buffer and DMAed, while the
+                // ups (and a gate) still go straight from the registered mapping.
+                stage_turn_ ^= 1;
+                uint8_t* h = h_stage_[stage_turn_];
+                const cudaEvent_t left = (cudaEvent_t) ev_stage_[stage_turn_];
+                ck(cudaEventSynchronize(left), "expert staging");
+                const auto gather = [&](int j) {
+                    const size_t e = (size_t) experts[(size_t) j0 + j];
+                    std::memcpy(h + (size_t) j * L.d_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
+                };
+                (alone ? *stagers_ : *workers_).run((int) c, gather);
+                for (size_t j = 0; j < c; ++j) {
+                    const size_t e = (size_t) experts[(size_t) j0 + (int) j];
+                    const size_t at = (size_t) (j0 + (int) j) * gu2;
+                    if (L.gated) {
+                        ck(cudaMemcpyAsync(dst + at, L.exp_gate + e * L.gu_stride, L.gu_bytes,
+                                           cudaMemcpyHostToDevice, cs(stream)),
+                           "expert staging");
+                        pin_dma_bytes_ += L.gu_bytes;
+                        ++pin_dmas_;
+                    }
+                    ck(cudaMemcpyAsync(dst + at + up_at, L.exp_up + e * L.gu_stride, L.gu_bytes,
+                                       cudaMemcpyHostToDevice, cs(stream)),
+                       "expert staging");
+                    pin_dma_bytes_ += L.gu_bytes;
+                    ++pin_dmas_;
+                }
+                ck(cudaMemcpyAsync(dst + down_at + (size_t) j0 * L.d_bytes, h, c * L.d_bytes,
+                                   cudaMemcpyHostToDevice, cs(stream)),
+                   "expert staging");
+                ck(cudaEventRecord(left, cs(stream)), "expert staging");
+                continue;
+            }
             for (size_t j = 0; j < c; ++j) {
                 const size_t e = (size_t) experts[(size_t) j0 + (int) j];
                 const size_t at = (size_t) (j0 + (int) j) * gu2;
@@ -3194,7 +3843,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             done = Clock::now();
         });
         cpu_experts(*workers_, host_.data(), (int) host_.size(), n, gt, dt, in_w, n_ff_exp_, h_x_, limit, gelu_,
-                    h_cpu_, 0, nullptr);
+                    h_cpu_, 0, nullptr, nullptr, nullptr);   // R56: no live-neuron index on the prompt path
         const double cpu = ms_since(start);
         behind.wait();
         const double gpu = std::chrono::duration<double, std::milli>(done - start).count();
@@ -3539,7 +4188,11 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
         } else {
             tail();
         }
-        if (want_logits) ck(cudaStreamSynchronize(cs(st_)), "eval");
+        if (want_logits) {
+            const Clock::time_point c0 = Clock::now();
+            ck(cudaStreamSynchronize(cs(st_)), "eval");
+            stats_.commit_ms += ms_since(c0);   // R51: the wait for the card, measured where it happens
+        }
     }
     // behind the logits: the caller has them while the card does this
     if (drafting()) draft_rows(tokens, ahead_pos_ == pos_ && tokens[0] == ahead_tok_ ? 1 : 0, n);
@@ -3823,7 +4476,11 @@ void Engine::window(const int32_t* tokens, int t) {
     finish_logits(wlogits_, t);
     ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
        "logits");
-    ck(cudaStreamSynchronize(cs(st_)), "window");
+    {
+        const Clock::time_point c0 = Clock::now();
+        ck(cudaStreamSynchronize(cs(st_)), "window");
+        stats_.commit_ms += ms_since(c0);   // R51: the answer's wait for the window's logits, measured
+    }
     if (timed && !recorded_) took_way(t, ms_since(t0));
     recorded_ = recorded_ || recorded;
     win_ = t;

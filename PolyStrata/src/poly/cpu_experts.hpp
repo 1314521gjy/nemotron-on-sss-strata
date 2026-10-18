@@ -54,6 +54,9 @@ struct CpuExpert {
     const uint8_t* down;
     float weight;
     int row = 0;
+    /// R57 (Stage C): this expert's neuron-major sidecar block (values 1,376,256 B | scales 172,032 B), or null
+    /// when the sidecar is off/refused - the down phase then runs ggml's vec_dot on the row-major `down` bytes.
+    const uint8_t* downT = nullptr;
 };
 
 /// Checks that ggml-cpu has a dot product for both types.  Call once per layer format at load.
@@ -71,8 +74,31 @@ bool mxfp4_block_to_q5_0(const uint8_t* src, uint8_t* dst);
 /// `meanwhile`, when given, is run once by one of the threads, beside the first products.  It must not throw.
 /// An expert whose `gate` is null is NOT gated (Nemotron's latent MoE): it has only up, activated by relu2.
 /// `n_out` is the width of a token's `out` row (0: n_embd; a latent MoE's is moe_latent_size).
+/// R51's ReLU^2 sparsity probe (read only, STRATA_PROBE_RELU2=1): a zero neuron, a 32-value block that is all
+/// zero, and a 64-byte weight line (IQ4_NL's 18-byte block: ~113.8 values) that no nonzero block touches.  The
+/// counts are the CPU expert path's decode uses; the line figure says how much of the down product's weights a
+/// skip at that granularity could spare.
+struct Relu2Probe {
+    long long values = 0, zeros = 0, blocks = 0, blocks_zero = 0, lines = 0, lines_zero = 0;
+};
+/// R56 (Stage B, STRATA_RELU2_DOWN=1): the live-neuron index of one call's expert uses, built from the relu2 output
+/// h (ascending: test the neurons in order, keep the h[i] != 0 ones), and the byte count a neuron-major ("T") down
+/// sidecar would be read with: per use, active_q8 * 512 (one neuron holds its 1024 output rows' four-bit values in
+/// 512 B) + groups * 2048 (a 32-neuron IQ4_NL block's fp16 scales over 1024 rows).  active_q8 is the set a bit-exact
+/// kernel may skip: hq's zeros (a small h may quantize to 0).  The index is the shape Stage C's kernel takes: neuron
+/// n's 512 bytes are at n*512 in its expert's sidecar block, and its scales at (n/32)*2048.
+struct Relu2Active {
+    bool sidecar = false;   ///< the sidecar is mapped (the first call prints the self-attesting line)
+    std::vector<int> idx;   ///< use 0's neurons, then use 1's, ... (ascending within a use)
+    std::vector<int> off;   ///< n_uses + 1: use j's neurons are idx[off[j] .. off[j+1])
+    long long active = 0, active_q8 = 0, groups = 0, bytes = 0;
+    long long uses = 0;
+    int n_ff = 0;
+};
 void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, int gu_type, int d_type, int n_embd,
                  int n_ff, const float* x, float limit, bool gelu, float* out, int n_out = 0,
-                 const std::function<void()>* meanwhile = nullptr);
+                 const std::function<void()>* meanwhile = nullptr, double* gate_up_ms = nullptr,
+                 double* quant_ms = nullptr, double* down_ms = nullptr, Relu2Probe* probe = nullptr,
+                 Relu2Active* relu2 = nullptr);
 
 }  // namespace strata::poly

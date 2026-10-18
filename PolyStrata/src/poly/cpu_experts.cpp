@@ -1,6 +1,7 @@
 // src/poly/cpu_experts.cpp - see the header.
 #include "cpu_experts.hpp"
 
+#include "relu2_down_t.hpp"
 #include "threads.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -186,7 +188,13 @@ bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::str
 
 void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, int gu_type, int d_type, int n_embd,
                  int n_ff, const float* x, float limit, bool gelu, float* out, int n_out,
-                 const std::function<void()>* meanwhile) {
+                 const std::function<void()>* meanwhile, double* gate_up_ms, double* quant_ms, double* down_ms,
+                 Relu2Probe* probe, Relu2Active* relu2) {
+    // R49's ledger: the three phases of the CPU expert pool, so its milliseconds can be read apart (the teacher's
+    // q38_perf pool line).  The timing is asked for only by the ledger print; nothing changes without it.
+    const auto now_ms = [] { return std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double t_phase = now_ms();
     init_once();
     const int out_w = n_out > 0 ? n_out : n_embd;   // a latent MoE's output row is narrower than the model's
     const ggml_type_traits_cpu* tg = traits(gu_type);
@@ -261,6 +269,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     const int* runp = run.data();
     const int gu_tasks = (n_ff + rows_per_task() - 1) / rows_per_task();
     const int first = meanwhile ? 1 : 0;   // task 0, so it is taken at once
+    t_phase = now_ms();
     workers.run(first + n_run * gu_tasks, [&](int t) {
         if (t < first) return (*meanwhile)();
         t -= first;
@@ -330,9 +339,130 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         }
         for (int r = r0; r < r1; ++r) one_up_row(r);
     });
+    if (gate_up_ms) *gate_up_ms += now_ms() - t_phase;
+    // R51: the ReLU^2 sparsity probe (read only; asked for by STRATA_PROBE_RELU2=1).  h[] now holds every use's
+    // activated up values: a zero neuron, a 32-value IQ4_NL block that is all zero (the down dot could skip its
+    // weight block), and a 64-byte weight line (~113.8 values: 3.56 blocks of 18 bytes) that no nonzero block
+    // touches (the line could be skipped whole).  Nothing is changed; the counts are printed and that is all.
+    if (probe) {
+        const int nb = n_ff / 32;
+        const int nline = (nb * 18 + 63) / 64;
+        for (int j = 0; j < n; ++j) {
+            const float* row = hp + (size_t) j * n_ff;
+            for (int r = 0; r < n_ff; ++r) {
+                ++probe->values;
+                if (row[r] == 0.f) ++probe->zeros;
+            }
+            for (int b = 0; b < nb; ++b) {
+                ++probe->blocks;
+                bool all0 = true;
+                for (int r = b * 32; r < b * 32 + 32 && all0; ++r) all0 = row[r] == 0.f;
+                if (all0) ++probe->blocks_zero;
+            }
+            for (int l = 0; l < nline; ++l) {
+                const int b0 = (int) (((long long) l * 64) / 18);
+                const int b1 = (int) (((long long) (l + 1) * 64 - 1) / 18);
+                if (b0 >= nb) break;
+                ++probe->lines;
+                bool all0 = true;
+                for (int b = b0; b <= b1 && b < nb && all0; ++b)
+                    for (int r = b * 32; r < b * 32 + 32 && all0; ++r) all0 = row[r] == 0.f;
+                if (all0) ++probe->lines_zero;
+            }
+        }
+    }
+    t_phase = now_ms();
     uint8_t* hqp = hq.data();
     const auto hq_from = traits(td->vec_dot_type)->from_float;
     workers.run(n, [&](int j) { hq_from(hp + (size_t) j * n_ff, hqp + (size_t) j * h_bytes, n_ff); });
+    if (quant_ms) *quant_ms += now_ms() - t_phase;
+    // R56 (Stage B, STRATA_RELU2_DOWN=1): the live-neuron index and the sidecar bytes a Stage C kernel would read.
+    // Read only: h and hq are the arrays this path already made, and nothing below changes.  This scan sits between
+    // the quant and down phase clocks, so the ledger's down GB/s keeps being the unchanged kernel's number.
+    if (relu2 && td->vec_dot_type == (int) GGML_TYPE_Q8_0) {
+        relu2->idx.clear();
+        relu2->off.assign(1, 0);
+        relu2->active = relu2->active_q8 = relu2->groups = relu2->bytes = relu2->uses = 0;
+        relu2->n_ff = n_ff;
+        const int nb = n_ff / 32;
+        const size_t qb = h_bytes / (size_t) nb;   // Q8_0: 34 B a block, 32 int8 at +2
+        for (int j = 0; j < n; ++j) {
+            const float* row = hp + (size_t) j * n_ff;
+            const int8_t* q = (const int8_t*) (hqp + (size_t) j * h_bytes);
+            long long act = 0;
+            for (int i = 0; i < n_ff; ++i)
+                if (row[i] != 0.f) { relu2->idx.push_back(i); ++act; }
+            long long q8n = 0, gn = 0;
+            for (int b = 0; b < nb; ++b) {
+                const int8_t* qs = q + (size_t) b * qb + 2;
+                bool any = false;
+                for (int i = 0; i < 32; ++i)
+                    if (qs[i] != 0) { any = true; ++q8n; }
+                if (any) ++gn;
+            }
+            relu2->active += act;
+            relu2->active_q8 += q8n;
+            relu2->groups += gn;
+            relu2->bytes += q8n * 512 + gn * 2048;
+            relu2->off.push_back((int) relu2->idx.size());
+            ++relu2->uses;
+        }
+        if (relu2->sidecar) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                const double u = (double) std::max<long long>(relu2->uses, 1);
+                std::fprintf(stderr,
+                             "relu2-down: sidecar on, active=%.0f/%d, bytes_read=%.1f KB (vs 1548 KB), uses=%lld, "
+                             "q8_active=%.0f, groups=%.1f/84\n",
+                             (double) relu2->active / u, n_ff, (double) relu2->bytes / u / 1000.0, relu2->uses,
+                             (double) relu2->active_q8 / u, (double) relu2->groups / u);
+            }
+        }
+    }
+    t_phase = now_ms();
+
+    // R57 (Stage C, STRATA_RELU2_DOWN=1): the neuron-major down kernel.  It is bit-exact with the vec_dot path
+    // below by construction (relu2_down_t.hpp reproduces ggml's eight int32 lanes per block, even/odd float
+    // accumulators, FMA and hsum tree; a skipped neuron has hq == 0 and so adds exactly 0 to an int32 sum).  It
+    // reads only this use's live neurons from the expert's sidecar block.  Falls back when a use has no sidecar
+    // block or the geometry is not the packed one (2688 neurons / 1024 rows).
+    bool downT = relu2 != nullptr && td->vec_dot_type == (int) GGML_TYPE_Q8_0 && n_ff == relu2t::kIn &&
+                 out_w == relu2t::kOut && relu2->uses == n;
+    for (int j = 0; downT && j < n; ++j) downT = experts[j].downT != nullptr;
+    if (downT) {
+        // NOTE: sd is this (the calling) thread's buffer; the workers get a pointer to it, not the thread_local
+        // variable - a lambda body that named sd would resolve to each worker's own empty instance (R57 crash 1).
+        static thread_local std::vector<float> sd;   // every use's 1024 down outputs
+        sd.assign((size_t) n * out_w, 0.f);
+        float* const sdp = sd.data();
+        workers.run(n * relu2t::kChunks, [&, sdp](int t) {
+            const int i = t / relu2t::kChunks, c = t % relu2t::kChunks;
+            relu2t::down_chunk(experts[i].downT, hqp + (size_t) i * h_bytes, relu2->idx.data() + relu2->off[i],
+                               relu2->off[i + 1] - relu2->off[i], c, sdp + (size_t) i * out_w);
+        });
+        // a token's sum in the order its experts were given, exactly as the row path below sums it
+        int j = 0;
+        for (int row = 0; row < rows; ++row) {
+            float* o = out + (size_t) row * out_w;
+            std::fill(o, o + out_w, 0.f);
+            for (; j < n && experts[j].row == row; ++j) {
+                const float w = experts[j].weight;
+                const float* s = sd.data() + (size_t) j * out_w;
+                for (int r = 0; r < out_w; ++r) o[r] += w * s[r];
+            }
+        }
+        static std::atomic<bool> said_t{false};
+        if (!said_t.exchange(true)) {
+            const double u = (double) std::max<long long>(relu2->uses, 1);
+            std::fprintf(stderr,
+                         "relu2-down: T kernel on, uses=%lld, live_avg=%.1f/%d, bytes/use=%.1f KB (vs %.1f KB) "
+                         "[block-order gather, bit-exact]\n",
+                         relu2->uses, (double) relu2->active / u, relu2t::kIn, (double) relu2->bytes / u / 1000.0,
+                         1548.288);
+        }
+        if (down_ms) *down_ms += now_ms() - t_phase;
+        return;
+    }
 
     const int d_tasks = (out_w + kRowsPerDownTask - 1) / kRowsPerDownTask;
     workers.run(d_tasks, [&](int t) {
@@ -370,6 +500,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         }
         for (int r = r0; r < r1; ++r) one_down_row(r);
     });
+    if (down_ms) *down_ms += now_ms() - t_phase;
 }
 
 }  // namespace strata::poly

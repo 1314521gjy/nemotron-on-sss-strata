@@ -169,6 +169,21 @@ struct Stats {
     int64_t pcie_experts = 0, pcie_dmas = 0;
     int64_t pcie_direct = 0;   ///< the split's uses read in place (--pcie-mode direct): no copy at all
     size_t pcie_dma_bytes = 0;
+    // R49's decode ledger (printed only): the four clocks of an answer's tokens, and the CPU expert pool's phases -
+    // the teacher's q38_perf fields, so our decode can be read segment by segment beside its own.
+    double pcie_wait_ms = 0;                                          ///< the compute stream waiting for the copies
+    double pool_gate_up_ms = 0, pool_quant_ms = 0, pool_down_ms = 0;   ///< the CPU experts' three phases (all calls)
+    // R51: the two segments R49 derived are measured here directly, plus the ReLU^2 sparsity probe's counts.
+    double launch_ms = 0;   ///< the thread that hands launches to the card: the true wall time of the launch code
+    double commit_ms = 0;   ///< true wall time spent waiting for the card (an answer's eval/window synchronize)
+    long long probe_values = 0, probe_zeros = 0, probe_blocks = 0, probe_blocks_zero = 0, probe_lines = 0,
+              probe_lines_zero = 0;
+    // R56 (Stage B, STRATA_RELU2_DOWN=1): the neuron-major down sidecar's read-only probe.  All zero when off.
+    // uses: expert uses whose live-neuron index was built (the decode path only); active: sum of h != 0 neurons;
+    // active_q8: sum of hq != 0 neurons (a bit-exact skip skips exactly these); groups: sum over uses of the
+    // 32-neuron IQ4_NL blocks with any hq != 0 (their fp16 scales must be read); bytes: sum over uses of
+    // active_q8*512 + groups*2048 = the sidecar bytes a Stage C kernel would read for them.
+    long long r2d_uses = 0, r2d_active = 0, r2d_active_q8 = 0, r2d_groups = 0, r2d_bytes = 0;
     double cpu_ms = 0, route_wait_ms = 0;
     /// cpu_ms less what the thread that handed the experts to the card spent: the CPU's own share of the phase, so
     /// that a split's PCIe work does not read as CPU time (an upper bound: the two overlap).
@@ -298,6 +313,9 @@ public:
     void load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n);
 
     const Stats& stats() const;
+    /// R56 (Stage B): whether STRATA_RELU2_DOWN=1 mapped the neuron-major down sidecar (never a compute path).
+    bool relu2_down_on() const { return r2d_base_ != nullptr; }
+    int expert_ff() const { return n_ff_exp_; }   ///< R56: a routed expert's hidden width (the sidecar's neurons)
     uint64_t pin_chunks() const { return pin_chunks_; }
     uint64_t pin_fallback_chunks() const { return pin_fallback_chunks_; }
     uint64_t pin_dmas() const { return pin_dmas_; }
@@ -326,6 +344,12 @@ public:
     /// definition for how much stays free).  True when it changed.
     bool mind_vram();
     void save_profile() const;
+    /// STRATA_PROMPT_BORROW: the prompt path's staging buffers are lent the expert cache's tail slots for the
+    /// length of a prompt, and the experts they stand in for are refilled after it, before the answer's first
+    /// token.  begin() is called when a prompt batch is read; end() when the prompt is done (its time is prompt
+    /// time).  Both do nothing unless the switch is on and a region was lent.
+    void prompt_borrow_begin();
+    void prompt_borrow_end();
 
 protected:
     // ---- what an architecture supplies ----
@@ -704,6 +728,32 @@ protected:
     double ahead_ms_ = 0, route_ms_ = 0;          ///< what that layer's copy ahead took, and the card to its routing
     bool shared_ahead_ = false;                   ///< read() runs several calls: each copies ahead, whatever its size
     size_t stage_bytes_ = 0, chunk_bytes_ = 0;
+    // STRATA_PROMPT_BORROW: the prompt's staging buffers (stage_, and with STRATA_STAGE_RING2 stage2_) are lent
+    // slots of the expert cache's tail for the length of a prompt; the experts those slots would hold are refilled
+    // after the prompt.  borrow_ is a mapping of its own, so cover() and shrink_cache() - which only ever cut
+    // arena_ - cannot take it; the experts it holds are slot pointers outside arena_, which shrink_cache() leaves
+    // alone.  Off (no mapping, no lent experts) unless the switch says 1: then the buffers hold their own VRAM
+    // exactly as they always did.
+    struct Lent { int il, e; size_t bytes; };
+    bool prompt_borrow_ = false;       ///< STRATA_PROMPT_BORROW=1
+    bool borrow_lend_ = false;         ///< prompt_borrow_ with at least one slot lent: stage_ is the region's
+    bool borrow_refill_ = true;        ///< STRATA_PROMPT_BORROW_REFILL=0: lend, but put nothing back (an A/B)
+    int borrow_slots_req_ = -1;        ///< STRATA_PROMPT_BORROW_SLOTS: the slots to lend; 0 = none, -1 = auto
+    int borrow_verify_ = 0;            ///< STRATA_PROMPT_BORROW_CHECK=n: check n refilled and n resident slots
+    size_t stage_alloc_bytes_ = 0;     ///< stage_bytes_ + 256 + kTail: what one staging buffer takes
+    size_t borrow_one_buffer_ = 0;     ///< the VRAM one staging buffer takes, measured by a probe of its size
+    size_t borrow_bytes_ = 0;          ///< the region's bytes
+    size_t borrow_off_[2] = {0, 0};    ///< the two staging buffers' places in the region
+    int borrow_buffers_ = 0;           ///< how many staging buffers the region holds (1, or 2 with ring2)
+    Mapped borrow_;                    ///< the region's VRAM: a mapping of its own, outside arena_
+    std::vector<Lent> borrow_cands_;   ///< the experts the cache would hold next, lowest rank first: refilled
+    int borrow_lent_ = 0;              ///< experts of borrow_cands_ resident in the region now
+    bool prompt_lent_ = false;         ///< the prompt is running: the region holds the staging buffers
+    double borrow_refill_ms_ = 0;      ///< the last refill's time
+    size_t borrow_refill_bytes_ = 0;   ///< and its bytes
+    void map_prompt_borrow();           ///< fill_expert_cache(): maps the region and checks it fits (loud)
+    void refill_prompt_borrow();        ///< prompt_borrow_end(): the experts back into the region, verified
+    void verify_prompt_borrow(const std::vector<Lent>& took);   ///< STRATA_PROMPT_BORROW_CHECK
     // --pcie-frac (Compile #1 skeleton, Compile #2 the split): the staging slots a share of an answer's misses are
     // copied into, and the stream and event that take them there.  Null and unallocated unless the switch is above
     // 0, so the default run's VRAM, expert cache and arithmetic are exactly as before.
@@ -725,6 +775,18 @@ protected:
     /// kernels can read the mapping in place.  Null on the layers that are not pinned or when direct is off.
     std::vector<const uint8_t*> exp_up_dev_, exp_down_dev_;
     size_t pin_bytes_ = 0;
+    // R56 (Stage B): the neuron-major down sidecar (STRATA_RELU2_DOWN=1).  Mapped read-only, NOT pinned and never
+    // read whole (it is a second 31.7 GB copy; pinning it would push this box past its RAM - R53 §0.3).  Stage B
+    // only maps it, checks its size against the geometry and four experts' blocks against the GGUF bytes, and lets
+    // cpu_experts() build the live-neuron index from it.  No kernel, slot, staging or GGUF pointer reads it.
+    const uint8_t* r2d_base_ = nullptr;   ///< the mapping, null unless on
+    size_t r2d_bytes_ = 0;                ///< its size
+    void* r2d_map_ = nullptr;             ///< the mapping object (closed in ~Engine)
+    void* r2d_file_ = nullptr;            ///< the file handle (closed in ~Engine)
+    size_t r2d_expert_bytes_ = 0;         ///< one expert's sidecar block = its down bytes in the GGUF
+    bool r2d_pinned_ = false;             ///< R57 option B: the sidecar is cudaHostRegisterReadOnly-pinned
+    std::vector<size_t> r2d_layer_off_;   ///< per layer: its experts' first sidecar byte (SIZE_MAX when not main MoE)
+    void relu2_down_open();               ///< load(): map and check the sidecar (loud; off by default)
     uint64_t pin_chunks_ = 0, pin_fallback_chunks_ = 0;   ///< stage() chunks taking the direct DMA / the old gather
     uint64_t pin_dmas_ = 0; size_t pin_dma_bytes_ = 0;    ///< the direct path's DMA count and bytes (size check)
     uint64_t fill_dmas_ = 0, swap_dmas_ = 0;              ///< R13: the load fill's and the swaps' copies
