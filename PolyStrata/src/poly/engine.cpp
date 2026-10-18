@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <new>
 #include <numeric>
+#include <random>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -388,6 +389,28 @@ struct Engine::Swap {
 
 Engine::Engine() = default;
 
+// Stage D D2a: one expert's down, row-major, written into a device destination (slot down segment / staging down
+// area / swap or borrow region).  The source is the pinned sidecar's T block: DMA it into the one-expert scratch,
+// then the R58-verified T->row kernel.  MMQ, mmvq, moe_card and the slot layout are untouched.
+void Engine::materialize_down(const Layer& L, int il, size_t e, uint8_t* dst, void* stream) {
+    const uint8_t* src = r2d_base_ + r2d_layer_off_[(size_t) il] + e * r2d_expert_bytes_;
+    uint8_t* scratch = (uint8_t*) r2d_scratch_for(stream);
+    ck(cudaMemcpyAsync(scratch, src, r2d_expert_bytes_, cudaMemcpyHostToDevice, (cudaStream_t) stream), "down T scratch");
+    kernels::native_relu2_t_to_row(scratch, dst, 2688, 1024, stream);
+}
+
+// One 1.48 MiB scratch for every stream that materializes down: fill/grow (null stream), refill (st_), ring2's
+// ahead copy (up_), a batch's stage (cp_/st_) and the swap follower (swap_st_) may all be in flight at once.
+void* Engine::r2d_scratch_for(void* stream) {
+    std::lock_guard<std::mutex> l(r2d_scratch_m_);
+    for (auto& e : r2d_scratch_)
+        if (e.first == stream) return e.second;
+    void* p = nullptr;
+    ck(cudaMalloc(&p, r2d_expert_bytes_), "down T scratch");
+    r2d_scratch_.emplace_back(stream, p);
+    return p;
+}
+
 namespace {
 
 // R56 (Stage B): the current process's working set, through psapi.dll dynamically (no link dependency on psapi.lib).
@@ -589,14 +612,92 @@ void Engine::relu2_down_open() {
         refuse("the sidecar does not match the GGUF's down bytes");
         return;
     }
-    // R57c (D0): the sidecar is NOT pinned here.  Prefill runs with the delivery's usual pin inventory (the GGUF's
-    // up AND down halves, pinned by pin_expert_arena()), and the down half's pin changes hands at the decode
-    // boundary in relu2_pin_switch().  Only the four check experts have been touched (6.2 MB): this is a mapping.
+    // ---- Stage D D3/D4/D8: the pin budget and the slot layout change at load, once ----
+    // Anything that would still read the GGUF row-major down is refused loudly (R63 reader table #14/#15/#16/#18).
+    if (block_layer_) {
+        refuse("--draft: the sidecar has no blk.88 (MTP) down; run with --no-draft");
+        return;
+    }
+    if (opt_.pcie_frac > 0.0) {
+        refuse("--pcie-frac>0 reads the GGUF down; not with STRATA_RELU2_DOWN=1");
+        return;
+    }
+    if (std::getenv("STRATA_STAGE_RING2_CHECK") || std::getenv("STRATA_PROMPT_BORROW_CHECK")) {
+        refuse("STRATA_STAGE_RING2_CHECK / STRATA_PROMPT_BORROW_CHECK memcmp GGUF down; not with the sidecar");
+        return;
+    }
+    // The sidecar takes its pin here: fault every page in first (cudaHostRegister does NOT prefault a file mapping -
+    // R57 §8), then pin.  Hard gate (lead + builder4): WS +>=27 GiB, 1000 random 4 KiB reads all <200 us, <=40 s;
+    // any miss = exit loudly (R57-E1: a half-resident sidecar ran decode at 1.59 tok/s).
+    {
+        const size_t ram_a = ram_available();
+        const ProcMem wsa = process_memory();
+        const Clock::time_point tf = Clock::now();
+        const int nt = std::max(1, (int) std::thread::hardware_concurrency());
+        std::vector<std::thread> th;
+        const size_t step = (r2d_bytes_ + (size_t) nt - 1) / (size_t) nt;
+        const auto touch = [&](size_t lo, size_t hi) {
+            volatile uint8_t seen = 0;
+            for (size_t at = lo; at < hi; at += 4096) seen = (uint8_t) (seen + r2d_base_[at]);
+            if (hi > lo) seen = (uint8_t) (seen + r2d_base_[hi - 1]);
+        };
+        for (int i = 1; i < nt; ++i)
+            th.emplace_back(touch, std::min(r2d_bytes_, (size_t) i * step),
+                            std::min(r2d_bytes_, (size_t) i * step + step));
+        touch(0, std::min(r2d_bytes_, step));
+        for (auto& t2 : th) t2.join();
+        const double secs = ms_since(tf) / 1000.0;
+        const ProcMem wsb = process_memory();
+        const size_t ram_b = ram_available();
+        const double ws_gib = ((double) wsb.ws - (double) wsa.ws) / (double) (size_t(1) << 30);
+        std::fprintf(stderr,
+                     "strata-poly: staged: faulted-in sidecar %.3f GiB in %.1f s (one-time), WS +%.1f GiB, avail %.1f "
+                     "-> %.1f GiB\n",
+                     (double) r2d_bytes_ / (double) (size_t(1) << 30), secs, ws_gib,
+                     (double) ram_a / (double) (size_t(1) << 30), (double) ram_b / (double) (size_t(1) << 30));
+        // random-read probe: 1000 x 4 KiB, each must come from RAM (a page fault would be far above 200 us)
+        uint8_t probe[4096];
+        double worst_us = 0.0;
+        std::mt19937 rng(2688u);
+        std::uniform_int_distribution<size_t> pick(0, (size_t) r2d_bytes_ - 4096);
+        for (int i = 0; i < 1000; ++i) {
+            const size_t at = pick(rng) & ~(size_t) 0xFFF;
+            const Clock::time_point t1 = Clock::now();
+            std::memcpy(probe, r2d_base_ + at, sizeof probe);
+            const double us = ms_since(t1) * 1000.0;
+            worst_us = std::max(worst_us, us);
+            probe[0] = (uint8_t) (probe[0] + 1);
+        }
+        std::fprintf(stderr, "strata-poly: staged: 1000 random 4 KiB reads, worst %.1f us (must be <200)\n", worst_us);
+        if (ws_gib < 27.0 || worst_us >= 200.0 || secs > 40.0) {
+            std::fprintf(stderr,
+                         "strata-poly: staged: REFUSED: fault-in gate failed (WS +%.1f GiB <27 or worst read %.1f us "
+                         ">=200 or %.1f s >40); the sidecar is not resident. RAM is not enough.\n",
+                         ws_gib, worst_us, secs);
+            std::exit(3);
+        }
+        const cudaError_t pr = cudaHostRegister((void*) r2d_base_, r2d_bytes_, cudaHostRegisterReadOnly);
+        if (pr != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "strata-poly: staged: REFUSED: sidecar cudaHostRegisterReadOnly: %s\n",
+                         cudaGetErrorString(pr));
+            std::exit(3);
+        }
+        r2d_pinned_ = true;
+    }
+    const size_t ram_ok = ram_available();
+    if (ram_ok < ((size_t) 8 << 30)) {
+        std::fprintf(stderr, "strata-poly: staged: REFUSED: avail RAM %.1f GiB < 8 GiB after pinning; exiting\n",
+                     (double) ram_ok / (double) (size_t(1) << 30));
+        std::exit(3);
+    }
     std::fprintf(stderr,
-                 "strata-poly: relu2-down: sidecar mapped %.3f GiB (deferred: pinned at the decode switch), "
-                 "ON-LOAD CHECK %d/%d experts == GGUF (0 diff), touched %.1f MB, WS +%.1f MB, %.1f ms\n",
-                 (double) expect / (double) (size_t(1) << 30), okv, okv + badv, (double) touched / 1e6,
-                 (double) (mem1.ws - mem0.ws) / 1e6, ms_since(t0));
+                 "strata-poly: staged: sidecar PINNED at load (%.2f GiB), up pinned (%.2f GiB), avail %.1f GiB; "
+                 "T->row materialization ON (fill/swap/stage/borrow keep row-major); ON-LOAD CHECK %d/%d experts == "
+                 "GGUF (%.1f MB, load-time only), WS +%.1f MB\n",
+                 (double) r2d_bytes_ / (double) (size_t(1) << 30), (double) pin_bytes_ / (double) (size_t(1) << 30),
+                 (double) ram_ok / (double) (size_t(1) << 30), okv, okv + badv, (double) touched / 1e6,
+                 (double) (mem1.ws - mem0.ws) / 1e6);
 }
 
 Engine::~Engine() {
@@ -1262,19 +1363,34 @@ void Engine::pin_expert_arena() {
     const char* env = std::getenv("STRATA_PIN_ARENA_GIB");
     const double gib = env ? std::atof(env) : 0.0;
     if (gib <= 0) return;
-    // R57c (D0): the pin inventory is UNCHANGED here - the GGUF's up AND down halves are page-locked exactly as the
-    // delivery always had them, so prefill stages both directly.  The down half's pin changes hands later, at the
-    // decode boundary only (relu2_pin_switch(), STRATA_RELU2_DOWN=1).
+    // Stage D D4: with the sidecar on, this function pins only the GGUF up half (29.53 GiB); the neuron-major
+    // sidecar takes the other 29.53 GiB at load.  The RAM floor must be the up half's, not the full 59.1: the
+    // budget's "keep every expert in memory" is the two halves taken together, and they are pinned at different
+    // points (sidecar first: relu2_down_open runs before this when the switch is on).
+    static const bool r2d_mode = [] {
+        const char* e = std::getenv("STRATA_RELU2_DOWN");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    // builder4's precise P1: floor = budget - the segment already pinned elsewhere + 8 GiB.  With the sidecar on,
+    // relu2_down_open() has already pinned r2d_bytes_ (it runs before alloc()), so this pins the up half against the
+    // rest of the budget.  When the sidecar is off / not mapped, r2d_base_ is null and the FULL 59.1 + 8 stays.
     const size_t budget = (size_t) (gib * (double) (size_t(1) << 30));
+    // builder4 P1: floor = budget - the segment already pinned elsewhere + 8 GiB.  relu2_down_open() runs before
+    // alloc() in r2d mode and has already pinned r2d_bytes_; r2d_base_ null keeps the FULL 59.1 + 8 floor.
+    const size_t already_pinned = r2d_base_ ? r2d_bytes_ : 0;
+    const size_t floor_bytes = budget - already_pinned + (size_t(8) << 30);
     const size_t ram_before = ram_available();
     // The user's floor: keep every expert in memory.  A full 40-layer pin is 59.06 GiB (40 x 1.4766); with this
     // box's 76 GiB free, 8 GiB headroom makes it fit where 16 GiB refused it whenever free RAM drifted down.
-    if (ram_before < budget + (size_t(8) << 30)) {
+    if (ram_before < floor_bytes) {
         std::fprintf(stderr,
                      "strata-poly: STRATA_PIN_ARENA_GIB=%.1f REFUSED: only %.1f GiB RAM free, needs %.1f + 8 GiB\n",
-                     gib, (double) ram_before / (double) (size_t(1) << 30), gib);
+                     gib, (double) ram_before / (double) (size_t(1) << 30),
+                     (double) (budget - already_pinned) / (double) (size_t(1) << 30));
         return;
     }
+    // Stage D D4: with the sidecar on, this function pins the GGUF up half only, and the neuron-major sidecar takes
+    // the other 29.53 GiB at load (relu2_down_open).  With the switch off: both halves, exactly as before.
     pin_layer_.assign(layers_.size(), 0);
     size_t used = 0;
     const Clock::time_point t0 = Clock::now();
@@ -1283,7 +1399,7 @@ void Engine::pin_expert_arena() {
         Layer& L = layers_[il];
         if (!L.moe || !L.exp_up || !L.exp_down) continue;
         const size_t up_len = (size_t) n_expert_ * L.gu_stride;
-        const size_t dn_len = (size_t) n_expert_ * L.d_bytes;
+        const size_t dn_len = r2d_mode ? 0 : (size_t) n_expert_ * L.d_bytes;
         const size_t gt_len = L.exp_gate ? (size_t) n_expert_ * L.gu_stride : 0;
         if (used + up_len + dn_len + gt_len > budget) break;   // whole layers only
         bool good = true;
@@ -1298,7 +1414,7 @@ void Engine::pin_expert_arena() {
             if (r != cudaSuccess) { cudaGetLastError(); good = false; }
         };
         reg(L.exp_up, up_len, "up");
-        if (good) reg(L.exp_down, dn_len, "down");
+        if (good && !r2d_mode) reg(L.exp_down, dn_len, "down");
         if (good && L.exp_gate) reg(L.exp_gate, gt_len, "gate");
         if (!good) { ++bad; break; }   // the failed register was printed above; keep what succeeded
         pin_layer_[il] = 1;
@@ -1539,7 +1655,9 @@ void Engine::fill_expert_cache() {
             ck(cudaMemcpy(s, L.exp_gate + e * L.gu_stride, L.gu_bytes, cudaMemcpyHostToDevice), "expert upload");
         ck(cudaMemcpy(s + L.slot_up(), L.exp_up + e * L.gu_stride, L.gu_bytes, cudaMemcpyHostToDevice),
            "expert upload");
-        ck(cudaMemcpy(s + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice),
+        if (r2d_base_)
+            materialize_down(L, (int) (&L - layers_.data()), e, s + L.slot_down(), nullptr);
+        else ck(cudaMemcpy(s + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice),
            "expert upload");
         ++fill_dmas_;
         fill_dma_bytes_ += (L.gated ? L.gu_bytes : 0) + L.gu_bytes + L.d_bytes;
@@ -1571,6 +1689,7 @@ void Engine::fill_expert_cache() {
                              "cached=%d exp_at=%zu MiB borrow=%zu MiB\n",
                      free_b >> 20, reserve_mib_, arena >> 20, arena_.mapped >> 20, cached_, exp_at_ >> 20,
                      borrow_bytes_ >> 20);
+    if (r2d_base_) ck(cudaStreamSynchronize(nullptr), "down T sync");   // P2: default stream done before use
 }
 
 // STRATA_PROMPT_BORROW: the region the prompt's staging buffers are lent from the expert cache's tail.  It is a
@@ -1690,7 +1809,10 @@ void Engine::refill_prompt_borrow() {
                "expert refill");
         ck(cudaMemcpyAsync(s + L.slot_up(), L.exp_up + e * L.gu_stride, L.gu_bytes, cudaMemcpyHostToDevice, cs(st_)),
            "expert refill");
-        ck(cudaMemcpyAsync(s + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice, cs(st_)),
+        if (r2d_base_)
+            materialize_down(L, (int) (&L - layers_.data()), e, s + L.slot_down(), cs(st_));
+        else ck(cudaMemcpyAsync(s + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice,
+                                cs(st_)),
            "expert refill");
         L.slot[e] = s;
         ++cached_;
@@ -1896,7 +2018,9 @@ int Engine::grow_cache(size_t bytes) {
             ck(cudaMemcpy(s, L.exp_gate + e * L.gu_stride, L.gu_bytes, cudaMemcpyHostToDevice), "expert upload");
         ck(cudaMemcpy(s + L.slot_up(), L.exp_up + e * L.gu_stride, L.gu_bytes, cudaMemcpyHostToDevice),
            "expert upload");
-        ck(cudaMemcpy(s + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice),
+        if (r2d_base_)
+            materialize_down(L, (int) (&L - layers_.data()), e, s + L.slot_down(), nullptr);
+        else ck(cudaMemcpy(s + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice),
            "expert upload");
         ++fill_dmas_;
         fill_dma_bytes_ += (L.gated ? L.gu_bytes : 0) + L.gu_bytes + L.d_bytes;
@@ -1904,6 +2028,7 @@ int Engine::grow_cache(size_t bytes) {
         ++cached_;
     }
     staged_il_ = -1;
+    if (r2d_base_) ck(cudaStreamSynchronize(0), "down T sync");   // D2a on the default stream: finish before use
     held_is_budget();
     return (int) taken.size();
 }
@@ -1923,6 +2048,19 @@ void Engine::plan_ahead(Layer& L, int il) {
 
 // The follower: an asked-for expert goes from the mapped file to its pinned buffer, and from there to its slot.
 // The file may have to be read for it, which is why this is not the engine's thread.
+namespace {
+// STRATA_SWAP_DIRECT_FROM_PIN (default 0): a swap of a pinned layer's expert copies the three slot parts straight
+// from the page-locked mapping instead of memcpy -> pinned -> one DMA.  The DMA sources are already resident and
+// registered; this only stops the follower from taking host bandwidth while the decode reads its misses.
+bool swap_direct_from_pin() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_SWAP_DIRECT_FROM_PIN");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
+}  // namespace
+
 void Engine::follow_loop() {
     cudaSetDevice(device_);   // a thread starts on card 0
     affinity::pin_aux_thread();   // --aux-cpus: no-op unless the switch named a processor for this thread
@@ -1940,9 +2078,32 @@ void Engine::follow_loop() {
         const size_t e = (size_t) s->e, gu = L.gu_bytes;
         if (L.gated) std::memcpy(s->pinned, L.exp_gate + e * L.gu_stride, gu);
         std::memcpy(s->pinned + L.slot_up(), L.exp_up + e * L.gu_stride, gu);
-        std::memcpy(s->pinned + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes);
-        cudaError_t err = cudaMemcpyAsync(s->slot, s->pinned, L.slot_down() + L.d_bytes, cudaMemcpyHostToDevice,
-                                          cs(swap_st_));
+        cudaError_t err = cudaSuccess;
+        if (r2d_base_) {   // gate|up first, then the down materialized T->row straight into the slot
+            err = cudaMemcpyAsync(s->slot, s->pinned, L.slot_down(), cudaMemcpyHostToDevice, cs(swap_st_));
+            if (err == cudaSuccess) materialize_down(L, s->il, e, s->slot + L.slot_down(), cs(swap_st_));
+        } else if (swap_direct_from_pin() && s->il >= 0 && (size_t) s->il < pin_layer_.size() &&
+                   pin_layer_[(size_t) s->il]) {
+            // #3': the layer's experts live in the pinned GGUF mapping; copy the slot straight from it.  No host
+            // memcpy -> pinned on the follower, so a swap takes no CPU bandwidth and no lock while a miss reads.
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "strata-poly: swap-direct: from the pinned mapping "
+                                     "(STRATA_SWAP_DIRECT_FROM_PIN=1)\n");
+            if (L.gated)
+                err = cudaMemcpyAsync(s->slot, L.exp_gate + e * L.gu_stride, gu, cudaMemcpyHostToDevice,
+                                      cs(swap_st_));
+            if (err == cudaSuccess)
+                err = cudaMemcpyAsync(s->slot + L.slot_up(), L.exp_up + e * L.gu_stride, gu,
+                                      cudaMemcpyHostToDevice, cs(swap_st_));
+            if (err == cudaSuccess)
+                err = cudaMemcpyAsync(s->slot + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes,
+                                      cudaMemcpyHostToDevice, cs(swap_st_));
+        } else {
+            std::memcpy(s->pinned + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes);
+            err = cudaMemcpyAsync(s->slot, s->pinned, L.slot_down() + L.d_bytes, cudaMemcpyHostToDevice,
+                                  cs(swap_st_));
+        }
         if (err == cudaSuccess) {
             ++swap_dmas_;
             swap_dma_bytes_ += (size_t) (L.slot_down() + L.d_bytes);
@@ -2136,6 +2297,15 @@ void Engine::load(const Options& o) {
                      "tail%s\n",
                      !borrow_lend_ ? "; STRATA_PROMPT_BORROW_SLOTS=0, none lent: they hold their own VRAM"
                      : borrow_refill_ ? "" : "; STRATA_PROMPT_BORROW_REFILL=0, nothing is put back");
+    // STRATA_CUT_HANDOFF: the per-layer handoff cuts (C1: a layer's routed-experts sum and latent projection are
+    // recorded once and replayed with one call; C3: a few rows' activation conversion runs on the calling thread
+    // instead of a worker pass).  Off by default - the delivery default is the old path byte for byte; =1 turns
+    // them on for the A/B.
+    if (const char* e = std::getenv("STRATA_CUT_HANDOFF"))
+        std::fprintf(stderr, "strata-poly: STRATA_CUT_HANDOFF=%s: %s\n", e,
+                     e[0] == '1' && e[1] == '\0'
+                         ? "on (the add+latent pair recorded a layer; the activation pass inline for a few rows)"
+                         : "off (the old launches)");
     gg_ = std::make_unique<Shards>(opt_.model);
     if (!opt_.draft_model.empty() && opt_.draft && opt_.window != 1) dg_ = std::make_unique<Shards>(opt_.draft_model);
     load_geometry();
@@ -2225,8 +2395,9 @@ void Engine::load(const Options& o) {
     // of eight.  The layers are counted by now.
     if (opt_.window == 0) opt_.window = recurrent_floats() == 0 || snaps_spread() ? 8 : 4;
     opt_.window = std::min({opt_.window, opt_.prompt_batch, opt_.max_context});
+    // Stage D: the sidecar is pinned and faulted in BEFORE alloc()/pin_expert_arena(), so that pin's floor subtracts it.
+    relu2_down_open();
     alloc();
-    relu2_down_open();   // R56 Stage B: STRATA_RELU2_DOWN=1 maps the neuron-major down sidecar (read only, no pin)
     if (!opt_.profile.empty()) read_profile(opt_.profile, (int) layers_.size(), n_expert_, prior_);
     fill_expert_cache();
     // STRATA_PROMPT_BORROW: the staging buffers the fill lent a region of the cache's tail are pointed at it now:
@@ -2296,11 +2467,18 @@ void Engine::load(const Options& o) {
     const int threads = opt_.threads > 0 ? opt_.threads : usable_cpus();
     mind_memory();
     std::vector<std::pair<const uint8_t*, size_t>> spans;   // the routed experts in the mapped files
+    // Stage D D4: with the sidecar on, the GGUF down pages are not needed at all (every fill/swap/stage source is
+    // the pinned sidecar), so do not pre-touch their 29.53 GiB (R63 #13; the RAM headroom comes from here).  The
+    // up/gate spans stay: the CPU's gate/up and the staging DMA still read them.
+    static const bool r2d_no_down_touch = [] {
+        const char* e = std::getenv("STRATA_RELU2_DOWN");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
     for (const Layer& L : layers_) {
         if (!L.moe) continue;
         if (L.exp_gate) spans.emplace_back(L.exp_gate, (size_t) n_expert_ * L.gu_stride);
         if (L.gu_stride == L.gu_bytes) spans.emplace_back(L.exp_up, (size_t) n_expert_ * L.gu_bytes);
-        spans.emplace_back(L.exp_down, (size_t) n_expert_ * L.d_bytes);
+        if (!r2d_no_down_touch) spans.emplace_back(L.exp_down, (size_t) n_expert_ * L.d_bytes);
     }
     if (!workers_) {   // a later card's engine has the first one's
         // --host-core/--aux-cpus: where the host thread, the CPU experts' workers and the auxiliary threads run.
@@ -2669,20 +2847,38 @@ void Engine::alloc() {
         rs_ = rs;
     }
     use_.assign(layers_.size() * n_expert_, 0);
+    use_decode_.assign(use_.size(), 0);    // STRATA_PROFILE_DECODE_ONLY: the answer's and the prompt's, apart
+    use_prefill_.assign(use_.size(), 0);
+    if (const char* pdo = std::getenv("STRATA_PROFILE_DECODE_ONLY"); pdo && pdo[0] == '1' && pdo[1] == '\0')
+        std::fprintf(stderr, "strata-poly: STRATA_PROFILE_DECODE_ONLY=1: the expert profile is built from the "
+                            "answer's routing only\n");
 }
 
 void Engine::save_profile() const {
     if (opt_.profile.empty()) return;
     if (!opt_.profile_write) return;   // DEFAULT READ-ONLY: only --expert-profile-write writes it back
+    // STRATA_PROFILE_DECODE_ONLY=1: the table is the answer's counts alone (the prompt's were 98.26% of every count
+    // the table was built from and did not match the decode distribution).  Off (the default): the counts are the
+    // ones it always wrote - the two sides added - so the release path is byte for byte the one it was.
+    static const bool decode_only = [] {
+        const char* e = std::getenv("STRATA_PROFILE_DECODE_ONLY");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
     const std::string tmp = opt_.profile + ".tmp";
     // every card's engine counts its own layers' experts, and the last one's profile has the draft block's too
     const Engine* last = this;
     while (last->next_) last = last->next_.get();
     std::vector<int64_t> all = last->prior_;
+    unsigned long long dec = 0, pre = 0;
     for (const Engine* e = this; e; e = e->next_.get()) {
-        if (all.size() < e->use_.size()) all.resize(e->use_.size(), 0);
-        for (size_t i = 0; i < e->use_.size(); ++i) all[i] += e->use_[i];
+        const std::vector<int64_t>& counts = decode_only ? e->use_decode_ : e->use_;
+        if (all.size() < counts.size()) all.resize(counts.size(), 0);
+        for (size_t i = 0; i < counts.size(); ++i) all[i] += counts[i];
+        for (const int64_t c : e->use_decode_) dec += (unsigned long long) c;
+        for (const int64_t c : e->use_prefill_) pre += (unsigned long long) c;
     }
+    if (decode_only)   // the two totals: a run shows the split the table was built from
+        std::fprintf(stderr, "strata-poly: profile: decode-only counts (decode=%llu prefill=%llu)\n", dec, pre);
     FILE* f = std::fopen(tmp.c_str(), "w");
     if (!f) throw std::runtime_error("cannot write " + tmp);
     long long saved = 0;
@@ -2912,6 +3108,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             for (int k = 0; k < n_used_; ++k) {
                 const size_t e = (size_t) ids[k];
                 ++use_[(size_t) il * n_expert_ + e];
+                ++use_decode_[(size_t) il * n_expert_ + e];   // STRATA_PROFILE_DECODE_ONLY: the answer's counts
                 if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += 1.f;
                 if (const uint8_t* s = L.slot[e]) {
                     cached[n_cached++] = {s, w[k], at + t};
@@ -3112,7 +3309,13 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 else if (gelu_) geglu_rows(g_, h_, n_ff_exp_, m, st_);
                 else swiglu_clamp_rows(g_, h_, n_ff_exp_, m, limit, st_);
                 kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
-                if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, out_w, st_)))
+                if (r2d_slots_t_) {   // Stage D D3: the slot's down segment holds the neuron-major T layout
+                    if (m > 1)
+                        kernels::native_mmvq_slots_T((int) L.d_type, down, m, n_ff_exp_, out_w, st_);
+                    else
+                        for (int j = 0; j < m; ++j)
+                            kernels::native_iq4_nl_mmvq_T(down.w[j], down.x[j], down.y[j], n_ff_exp_, out_w, 1, st_);
+                } else if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, out_w, st_)))
                     for (int j = 0; j < m; ++j)
                         kernels::native_mmvq((int) L.d_type, down.w[j], down.x[j], down.y[j], n_ff_exp_, out_w, 1,
                                              st_);
@@ -3172,7 +3375,14 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                     else if (gelu_) geglu_rows(g_, h_, n_ff_exp_, m, st_);
                     else swiglu_clamp_rows(g_, h_, n_ff_exp_, m, limit, st_);
                     kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
-                    if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, out_w, st_)))
+                    if (r2d_slots_t_) {   // Stage D D3: the slot's down segment holds the neuron-major T layout
+                        if (m > 1)
+                            kernels::native_mmvq_slots_T((int) L.d_type, down, m, n_ff_exp_, out_w, st_);
+                        else
+                            for (int j = 0; j < m; ++j)
+                                kernels::native_iq4_nl_mmvq_T(down.w[j], down.x[j], down.y[j], n_ff_exp_, out_w, 1,
+                                                              st_);
+                    } else if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, out_w, st_)))
                         for (int j = 0; j < m; ++j)
                             kernels::native_mmvq((int) L.d_type, down.w[j], down.x[j], down.y[j], n_ff_exp_, out_w, 1,
                                                  st_);
@@ -3272,6 +3482,10 @@ bool Engine::card_moe(int n) {
 // the card, an expert's slot read from d_slots_ by its pick.  False, with nothing launched: this layer is routed
 // on the host, or its formats have no kernel for picks on the card.
 bool Engine::moe_card(Layer& L, int il, int n) {
+    if (r2d_slots_t_) {   // Stage D: the card's routed down kernel reads the row-major slot; the T layout is D3+
+        L.card = 0;
+        return false;
+    }
     if (!L.gated) return false;   // the card's routed launches are wired for gated experts (moe_rows() takes it next)
     if (L.card == 0) return false;
     if (!kernels::native_mmvq_ids_supported((int) L.gu_type) || !kernels::native_mmvq_ids_supported((int) L.d_type) ||
@@ -3329,9 +3543,12 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
                 ck(cudaMemcpyAsync(dst + at + up_at, L.exp_up + e * L.gu_stride, L.gu_bytes,
                                    cudaMemcpyHostToDevice, cs(stream)),
                    "expert staging");
-                ck(cudaMemcpyAsync(dst + down_at + (size_t) (j0 + (int) j) * L.d_bytes,
-                                   L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice, cs(stream)),
-                   "expert staging");
+                if (r2d_base_)
+                    materialize_down(L, il, e, dst + down_at + (size_t) (j0 + (int) j) * L.d_bytes, cs(stream));
+                else
+                    ck(cudaMemcpyAsync(dst + down_at + (size_t) (j0 + (int) j) * L.d_bytes,
+                                       L.exp_down + e * L.d_bytes, L.d_bytes, cudaMemcpyHostToDevice, cs(stream)),
+                       "expert staging");
                 pin_dma_bytes_ += L.gu_bytes + L.d_bytes;
                 pin_dmas_ += 2;
             }
@@ -3347,14 +3564,20 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
             const int k = i % pieces;
             if (L.gated && k == 0) std::memcpy(h + j * gu2, L.exp_gate + e * L.gu_stride, L.gu_bytes);
             else if (k == (L.gated ? 1 : 0)) std::memcpy(h + j * gu2 + up_at, L.exp_up + e * L.gu_stride, L.gu_bytes);
-            else std::memcpy(h + c * gu2 + j * L.d_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
+            else if (!r2d_base_) std::memcpy(h + c * gu2 + j * L.d_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
         };
         (alone ? *stagers_ : *workers_).run((int) (pieces * c), copy);
         ck(cudaMemcpyAsync(dst + (size_t) j0 * gu2, h, c * gu2, cudaMemcpyHostToDevice, cs(stream)),
            "expert staging");
-        ck(cudaMemcpyAsync(dst + down_at + (size_t) j0 * L.d_bytes, h + c * gu2, c * L.d_bytes,
-                           cudaMemcpyHostToDevice, cs(stream)),
-           "expert staging");
+        if (r2d_base_) {
+            for (size_t j = 0; j < c; ++j) {
+                const size_t e = (size_t) experts[(size_t) j0 + (int) j];
+                materialize_down(L, il, e, dst + down_at + ((size_t) j0 + j) * L.d_bytes, cs(stream));
+            }
+        } else
+            ck(cudaMemcpyAsync(dst + down_at + (size_t) j0 * L.d_bytes, h + c * gu2, c * L.d_bytes,
+                               cudaMemcpyHostToDevice, cs(stream)),
+               "expert staging");
         ck(cudaEventRecord(left, cs(stream)), "expert staging");
     }
     ck(cudaMemsetAsync(dst + down_at + (size_t) m * L.d_bytes, 0, kTail, cs(stream)), "expert staging");
@@ -3486,6 +3709,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     for (int i = 0; i < rr; ++i) {
         ++count_[(size_t) ids_[(size_t) i]];
         ++use_[(size_t) il * n_expert_ + (size_t) ids_[(size_t) i]];
+        ++use_prefill_[(size_t) il * n_expert_ + (size_t) ids_[(size_t) i]];   // and the prompt's, apart
     }
     // The CPU computes some of the routed experts outside VRAM while the others are copied: the ones the fewest
     // tokens chose, whose copy costs as much as any other's and which cost the CPU about as much as their tokens.
@@ -3498,7 +3722,10 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             if (count_[(size_t) e] > 0 && !L.slot[(size_t) e]) spare_.push_back(e);
         std::stable_sort(spare_.begin(), spare_.end(),
                          [&](int32_t a, int32_t b) { return count_[(size_t) a] < count_[(size_t) b]; });
-        n_spare = (int) spare_.size();
+        // Stage D: CPU-share stays ON.  Its experts run the already-verified CPU T kernel (R57) on the pinned sidecar
+    // via CpuExpert.downT (set where host_ is built), so this path reads no GGUF down; the live-neuron index costs
+    // ~0.85 KB a use and a few ms a layer.
+    n_spare = (int) spare_.size();
         const double s = opt_.cpu_share > 0 ? std::min(opt_.cpu_share, 1.f) : share_[size];
         n_cpu = (int) std::lround(s * n_spare);
         for (int j = 0; j < n_cpu; ++j) on_cpu_[(size_t) spare_[(size_t) j]] = 1;
@@ -3539,8 +3766,10 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         if (on_cpu_[e]) {   // by token, as cpu_experts() takes them, and nothing of it in the card's sum
             // the gate as moe() builds it: a non-gated expert (Nemotron) has none, and exp_gate + offset there
             // would be null + offset (moe_rows() reaches this only for a gated layer today; B3 opens it wider).
+            const uint8_t* downT =
+                r2d_base_ ? r2d_base_ + r2d_layer_off_[(size_t) il] + e * r2d_expert_bytes_ : nullptr;
             host_.push_back({L.gated ? L.exp_gate + e * L.gu_stride : nullptr, L.exp_up + e * L.gu_stride,
-                             L.exp_down + e * L.d_bytes, w[i], i / n_used_});
+                             L.exp_down + e * L.d_bytes, w[i], i / n_used_, downT});
             w[i] = 0.f;
             continue;
         }
@@ -3879,8 +4108,9 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             ck(cudaStreamSynchronize(cs(st_)), "expert staging");
             done = Clock::now();
         });
+        Relu2Active r2a;   // Stage D: CPU-share experts run the R57 T kernel on the pinned sidecar (no GGUF down)
         cpu_experts(*workers_, host_.data(), (int) host_.size(), n, gt, dt, in_w, n_ff_exp_, h_x_, limit, gelu_,
-                    h_cpu_, 0, nullptr, nullptr, nullptr);   // R56: no live-neuron index on the prompt path
+                    h_cpu_, 0, nullptr, nullptr, nullptr, nullptr, nullptr, r2d_base_ ? &r2a : nullptr);
         const double cpu = ms_since(start);
         behind.wait();
         const double gpu = std::chrono::duration<double, std::milli>(done - start).count();
@@ -4020,7 +4250,23 @@ void Engine::run(const int32_t* tokens, int n) {
         if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, m); });
         else layer_tail(L, il, m);
     };
-
+    // STRATA_CUT_HANDOFF: a layer's routed-experts sum and its latent projection are the same launches for a token
+    // at a time, so the pair is recorded once as a graph a kind - with the CPU experts' sum and without it - and
+    // replayed with one call.  Only a token at a time is recorded: a window moves the buffers (shift_rows()), so its
+    // launches stay the ones they were.  The cache lives here, keyed by this engine and the layer: a graph recorded
+    // for one engine's buffers is never replayed by another's.
+    static const bool cut_handoff = [] {
+        const char* e = std::getenv("STRATA_CUT_HANDOFF");
+        return e && e[0] == '1' && e[1] == '\0';   // off by default: the delivery path is the old launches
+    }();
+    static std::map<std::pair<const void*, std::pair<int, int>>, std::vector<void*>> after_graphs;
+    const auto replay_after = [&](int il, bool added, const std::function<void()>& work) {
+        std::vector<void*>& made =
+            after_graphs[std::make_pair((const void*) this, std::make_pair(il, added ? 1 : 0))];
+        if (made.empty()) made.resize(1, nullptr);
+        if (!made[0]) made[0] = record(work);
+        ck(cudaGraphLaunch((cudaGraphExec_t) made[0], cs(st_)), "layer graph");
+    };
     // A window's tokens, with experts on the CPU, go through the layers together or in two halves, one behind
     // the other (halves_, which window() sets).  Together, the card's part of a layer and the CPU's take turns:
     // the card waits out the CPU's experts and the CPU the card's layer.  In halves each has work while the
@@ -4149,9 +4395,21 @@ void Engine::run(const int32_t* tokens, int n) {
         Layer& L = layers_[(size_t) il];
         up(il, n, (size_t) n - 1);
         if (!L.moe) continue;
-        if (batched(L, n)) moe_rows(L, il, n);
-        else if (!on_card(il, n, (size_t) n - 1) && moe(L, il, n)) moe_add(L, n);
-        moe_latent(L, n);
+        bool added = false;
+        if (batched(L, n)) {
+            moe_rows(L, il, n);
+        } else {
+            added = !on_card(il, n, (size_t) n - 1) && moe(L, il, n);
+        }
+        if (cut_handoff && replay && n == 1 && L.fixed) {
+            replay_after(il, added, [&] {
+                if (added) moe_add(L, n);
+                moe_latent(L, n);
+            });
+        } else {
+            if (added) moe_add(L, n);
+            moe_latent(L, n);
+        }
         tail(il, n, (size_t) n - 1);
     }
 }

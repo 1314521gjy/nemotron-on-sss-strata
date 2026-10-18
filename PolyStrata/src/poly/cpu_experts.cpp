@@ -21,6 +21,7 @@
 #include <immintrin.h>
 #include <mutex>
 #include <numeric>
+#include <stdexcept>
 
 namespace strata::poly {
 namespace {
@@ -245,7 +246,19 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     // waiting, here and before the down products
     uint8_t* actp = act.data();
     const auto act_from = traits(tg->vec_dot_type)->from_float;
-    workers.run(rows, [&](int t) { act_from(x + (size_t) t * n_embd, actp + (size_t) t * a_bytes, n_embd); });
+    // STRATA_CUT_HANDOFF: for a few rows the conversion is cheaper on this thread than the worker pass' handshake,
+    // and the values are the same function of the same row (each row's bytes are this call's; the tasks below only
+    // read what is written here, and each row is converted exactly once).  Off by default (=1 turns it on); with it
+    // off the workers get the whole rows pass as they always did, byte for byte.
+    static const bool cut_handoff = [] {
+        const char* e = std::getenv("STRATA_CUT_HANDOFF");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    if (cut_handoff && rows <= 32) {
+        for (int t = 0; t < rows; ++t) act_from(x + (size_t) t * n_embd, actp + (size_t) t * a_bytes, n_embd);
+    } else {
+        workers.run(rows, [&](int t) { act_from(x + (size_t) t * n_embd, actp + (size_t) t * a_bytes, n_embd); });
+    }
 
     // The uses of one expert next to each other (by), and where each expert's run of them starts (run).
     by.resize((size_t) n);
@@ -429,6 +442,11 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     bool downT = relu2 != nullptr && td->vec_dot_type == (int) GGML_TYPE_Q8_0 && n_ff == relu2t::kIn &&
                  out_w == relu2t::kOut && relu2->uses == n;
     for (int j = 0; downT && j < n; ++j) downT = experts[j].downT != nullptr;
+    // Stage D: when the caller asked for the T path, never fall back silently to the GGUF row-major down copy
+    // (the sidecar is the only host copy; a fallback would read GGUF down out of the R63 reader table).
+    if (relu2 != nullptr && !downT)
+        throw std::runtime_error("relu2 T down: the live index / downT does not cover this call; refusing the GGUF "
+                                 "down read");
     if (downT) {
         // NOTE: sd is this (the calling) thread's buffer; the workers get a pointer to it, not the thread_local
         // variable - a lambda body that named sd would resolve to each worker's own empty instance (R57 crash 1).
