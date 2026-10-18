@@ -484,7 +484,7 @@ void relu2_from_T(const uint8_t* vals, const uint8_t* scales, int n_ff, size_t d
 
 // R56 (Stage B): STRATA_RELU2_DOWN=1 maps the neuron-major down sidecar and checks it against the GGUF.  The
 // geometry must be the one Stage A packed (2688 neurons, 1024 rows, 512 experts, 40 main MoE layers).  The sidecar
-// is NOT pinned and not touched whole: only the four check experts' blocks are read (R53 §0.3: it is a second
+// is NOT pinned and not touched whole: only the four check experts' blocks are read (R53 搂0.3: it is a second
 // 31.7 GB copy, and pinning it would put this box past its RAM).  Every failure is loud and turns the switch off:
 // the run then takes exactly the default path, which never reads this mapping.
 void Engine::relu2_down_open() {
@@ -638,7 +638,7 @@ void Engine::relu2_down_open() {
         return;
     }
     // The sidecar takes its pin here: fault every page in first (cudaHostRegister does NOT prefault a file mapping -
-    // R57 §8), then pin.  Hard gate (lead + builder4): WS +>=27 GiB, 1000 random 4 KiB reads all <200 us, <=40 s;
+    // R57 搂8), then pin.  Hard gate (lead + builder4): WS +>=27 GiB, 1000 random 4 KiB reads all <200 us, <=40 s;
     // any miss = exit loudly (R57-E1: a half-resident sidecar ran decode at 1.59 tok/s).
     {
         const size_t ram_a = ram_available();
@@ -751,6 +751,7 @@ Engine::~Engine() {
     if (rs_) cudaStreamSynchronize(cs(rs_));
     if (pcie_st_) cudaStreamSynchronize(cs(pcie_st_));   // --pcie-frac: the copies into the staging slots
     if (st_) cudaStreamSynchronize(cs(st_));
+    if (sh_) cudaStreamSynchronize(cs(sh_));   // STRATA_SHARED_OVERLAP: its last products before the stream goes
     finish_async_refill();   // STRATA_BORROW_ASYNC_REFILL: no dropped work; its slots become resident, then they go
     workers_.reset();
     mmq_.reset();
@@ -760,7 +761,7 @@ Engine::~Engine() {
     vmm_free(borrow_);   // STRATA_PROMPT_BORROW: the region the prompt's staging buffers were lent
     for (void* p : host_allocs_) cudaFreeHost(p);
     for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_in_[0], ev_in_[1], ev_out_[0], ev_out_[1],
-                    ev_hr_, ev_krn_, ev_copy_, ev_pcie_, ev_refill_})
+                    ev_hr_, ev_krn_, ev_copy_, ev_pcie_, ev_refill_, ev_sh_, ev_st_})
         if (e) cudaEventDestroy((cudaEvent_t) e);
     for (int s = 0; s < 2; ++s)
         for (void* e : {ev_ring_ahead_[s], ev_ring_free_[s]})
@@ -778,6 +779,7 @@ Engine::~Engine() {
     if (pcie_st_) cudaStreamDestroy(cs(pcie_st_));
     if (st_) cudaStreamDestroy(cs(st_));
     if (as_) cudaStreamDestroy(cs(as_));   // STRATA_BORROW_ASYNC_REFILL: the refill's own stream
+    if (sh_) cudaStreamDestroy(cs(sh_));   // STRATA_SHARED_OVERLAP: the shared expert's stream
 }
 
 void* Engine::dmalloc(size_t bytes, const char* what) {
@@ -1482,7 +1484,7 @@ bool Engine::relu2_pin_switch() {
         }
     }
     if (bad != 0) std::fprintf(stderr, "strata-poly: pin switch: %d down ranges refused to unregister\n", bad);
-    // R57c-fix: cudaHostRegisterReadOnly does NOT fault a file mapping's pages in (R57 §8: the first switch took
+    // R57c-fix: cudaHostRegisterReadOnly does NOT fault a file mapping's pages in (R57 搂8: the first switch took
     // 567 ms and avail did not move, so the decode still page-faulted every sidecar read).  Touch one byte of every
     // 4 KiB page of the sidecar before registering it: that faults the whole 29.53 GiB in (the pages we just let go
     // of, the GGUF down half, are what Windows reclaims for them), and the registration then pins resident pages.
@@ -2875,7 +2877,7 @@ void Engine::alloc() {
         Layer& L = layers_[(size_t) il];
         if (!L.moe) continue;
         // the batched MMQ path: moe_rows()/stage() now take the widths from the expert's own layout (slot_up()/
-        // slot_down(), a relu2 for the non-gated), so a non-gated (latent) layer takes it too.  B3, B3-配方盘点-20261016.md.
+        // slot_down(), a relu2 for the non-gated), so a non-gated (latent) layer takes it too.  B3, B3-閰嶆柟鐩樼偣-20261016.md.
         const int gu_w = L.gated ? 2 * n_ff_exp_ : n_ff_exp_;
         L.mmq = opt_.gpu_experts && rows_ >= kStageRows &&
                 Mmq::fits((int) L.gu_type, gu_w, L.exp_in > 0 ? L.exp_in : n_embd_) &&
@@ -2905,6 +2907,35 @@ void Engine::alloc() {
     const int q_max = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256});
     xq_ = dmalloc(n * kernels::native_q8_1_bytes(n_embd_), "scratch");
     q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
+    // STRATA_SHARED_OVERLAP=1: the shared expert's two products run on a stream of its own in decode (n <= 8
+    // tokens), beside the routed experts' work; moe_latent() waits for its event before the add into fo_.  Its
+    // rows and quantized inputs are its own (the routed path uses g_/h_/q8_ at the same time).  Off: nothing is
+    // made and every call runs as it always did, byte for byte.
+    static const bool shared_overlap_env = [] {
+        const char* e = std::getenv("STRATA_SHARED_OVERLAP");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    if (shared_overlap_env && n_ff_shexp_ > 0 && !all_cached()) {
+        cudaStream_t sh = nullptr;
+        ck(cudaStreamCreateWithFlags(&sh, cudaStreamNonBlocking), "cudaStreamCreate");
+        sh_ = sh;
+        cudaEvent_t ev = nullptr;
+        ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+        ev_sh_ = ev;
+        ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+        ev_st_ = ev;
+        sh_g_ = (float*) dmalloc((size_t) 8 * n_ff_shexp_ * sizeof(float), "the shared expert's rows");
+        sh_h_ = (float*) dmalloc((size_t) 8 * n_ff_shexp_ * sizeof(float), "the shared expert's rows");
+        q8_sh_ = dmalloc((size_t) 8 * kernels::native_q8_1_bytes(std::max(n_embd_, n_ff_shexp_)),
+                         "the shared expert's scratch");
+        if (bf16_max_ > 0)
+            wf_sh_ = (float*) dmalloc(bf16_max_ * sizeof(float), "the shared expert's scratch");   // lin's BF16 path
+        shared_overlap_ = true;
+        std::fprintf(stderr, "shared-overlap: moe_shared on stream sh_ (event before the routed add)\n");
+    } else if (shared_overlap_env) {
+        std::fprintf(stderr, "strata-poly: STRATA_SHARED_OVERLAP=1 needs a shared expert and experts outside the "
+                             "cache (the recorded-graph path keeps the old call): the switch stays off\n");
+    }
 
     h_r_ = (float*) hmalloc(n * streams() * n_embd_ * sizeof(float), "pinned memory");
     at_ = (long long*) dmalloc((size_t) opt_.window * 2 * sizeof(long long), "scratch");
@@ -3227,38 +3258,45 @@ void Engine::dbg(const char* name, int il, const float* dev, int n) {
 
 // y = w x for n tokens.  xq is x already in Q8_1, when the caller has it.  rows_per_x below n_out gives each group
 // of rows its own input (see gemv_f32); only the float types take it.
-void Engine::lin(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x) {
+void Engine::lin(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x, void* s) {
+    // The stream the products go on: st_ unless a caller runs them beside it (STRATA_SHARED_OVERLAP's shared expert).
+    cudaStream_t st = s != nullptr ? (cudaStream_t) s : cs(st_);
+    // The scratch a product quantizes into (and the BF16 matrix's floats): the members' when the product runs on
+    // st_, the shared expert's own when a caller runs it beside st_ (STRATA_SHARED_OVERLAP) - two streams must not
+    // write one scratch.  With s == nullptr this is the old code, byte for byte.
+    void* q8 = s ? q8_sh_ : q8_;
+    float* wf = s ? wf_sh_ : wf_;
     if (w.type == kTypeF32 || w.type == kTypeBF16) {
         const int per = rows_per_x ? rows_per_x : w.n_out;
         const size_t count = (size_t) w.n_in * w.n_out;
         // A prompt batch: one matrix product.  The kernel below has a block for every output of every token,
         // and GLM 5.3 Flash's per-head projections are 32,768 outputs a token.
-        if (n >= kStageRows && (w.type == kTypeF32 || (wf_ && count <= bf16_max_))) {
-            const float* wf = fp(w);
+        if (n >= kStageRows && (w.type == kTypeF32 || (wf && count <= bf16_max_))) {
+            const float* wf2 = fp(w);
             if (w.type == kTypeBF16) {
-                bf16_to_f32((const uint16_t*) w.p, wf_, count, st_);
-                wf = wf_;
+                bf16_to_f32((const uint16_t*) w.p, wf, count, st);
+                wf2 = wf;
             }
-            return gemm_f32(blas_, wf, x, y, w.n_in, w.n_out, per, n);
+            return gemm_f32(blas_, wf2, x, y, w.n_in, w.n_out, per, n);
         }
-        if (w.type == kTypeF32) return gemv_f32(fp(w), x, y, w.n_in, w.n_out, per, n, st_);
-        return gemv_bf16((const uint16_t*) w.p, x, y, w.n_in, w.n_out, per, n, st_);
+        if (w.type == kTypeF32) return gemv_f32(fp(w), x, y, w.n_in, w.n_out, per, n, st);
+        return gemv_bf16((const uint16_t*) w.p, x, y, w.n_in, w.n_out, per, n, st);
     }
     // a prompt batch: llama.cpp's matrix-matrix kernels read the weights once for all the tokens
     if (mmq_ && n >= kStageRows && Mmq::fits((int) w.type, w.n_out, w.n_in)) {
-        Mmq::quantize(x, nullptr, mqx_, (int) w.type, w.n_in, w.n_in, n, st_);
-        return mmq_->mul(w.p, (int) w.type, w.n_out, w.n_in, 0, 1, mqx_, nullptr, nullptr, n, n, y, w.n_out, st_);
+        Mmq::quantize(x, nullptr, mqx_, (int) w.type, w.n_in, w.n_in, n, st);
+        return mmq_->mul(w.p, (int) w.type, w.n_out, w.n_in, 0, 1, mqx_, nullptr, nullptr, n, n, y, w.n_out, st);
     }
     if (!xq) {
         // the tokens' blocks are back to back, so they quantize as one long vector
-        kernels::native_quantize_q8_1(x, q8_, w.n_in * n, 1, st_);
-        xq = q8_;
+        kernels::native_quantize_q8_1(x, q8, w.n_in * n, 1, st);
+        xq = q8;
     }
     // a launch takes up to 8 tokens, and each comes out as it would alone
     const size_t token = kernels::native_q8_1_bytes(w.n_in);
     for (int at = 0; at < n; at += 8)
         kernels::native_mmvq((int) w.type, w.p, (const uint8_t*) xq + (size_t) at * token,
-                             y + (size_t) at * w.n_out, w.n_in, w.n_out, std::min(8, n - at), st_);
+                             y + (size_t) at * w.n_out, w.n_in, w.n_out, std::min(8, n - at), st);
 }
 
 // STRATA_DUMP_ROUTE=1 only (default 0: never called).
@@ -3293,7 +3331,7 @@ void Engine::moe_router(const Layer& L, int n) {
         lin(L.latent_down, xn_, moe_in_, n, xq_);
         // the tokens' rows back to back as one column, as lin() does: in_w is a multiple of the 32-element block, so
         // no block crosses a token and this is bitwise the same as n columns.  n as ncols overflowed native MMVQ's
-        // MAX_NCOLS for a prompt over 8 tokens (t13, P3-20261016\提速施工单-20261016.md §1).
+        // MAX_NCOLS for a prompt over 8 tokens (t13, P3-20261016\鎻愰€熸柦宸ュ崟-20261016.md 搂1).
         kernels::native_quantize_q8_1(moe_in_, xq_, in_w * n, 1, st_);
         in = moe_in_;
     }
@@ -3485,7 +3523,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 }
                 // STRATA_PROBE_XQ=<path>: dump each (pos, row, j)'s xq_row input bytes before the up mmvq, so two
                 // runs' files can be diffed - the mmvq itself is reproducible (PROBE_REPEAT), so a difference here
-                // is the source.  A synced observation (观测掩盖律): read it against a no-hook run in the same batch.
+                // is the source.  A synced observation (瑙傛祴鎺╃洊寰?: read it against a no-hook run in the same batch.
                 if (static const char* xqf = std::getenv("STRATA_PROBE_XQ"); xqf && il == 1) {
                     static FILE* fp = std::fopen(xqf, "ab");
                     if (fp) {
@@ -3683,7 +3721,69 @@ void Engine::moe_add(Layer& L, int n) {
 }
 
 // A latent MoE's routed sum is in moe_out_ (exp_out wide); latent_up maps it into fo_, where the shared expert is.
+// STRATA_SHARED_TIMING=1: the same call, timed.  The decode steps are the n == 1 calls; the ledger prints
+// shared_n1_ms / shared_n1 as "ms/token".  Default 0: one getenv at first use, then the plain call.
+void Engine::moe_shared_timed(const Layer& L, int il, int n) {
+    // STRATA_SKIP_SHARED=1: a TIMING PROBE only - the shared expert is not run at all, so fo_ loses its
+    // contribution and the ids differ (class-E, never for a numeric gate).  Default 0: byte for byte the old path.
+    static const bool skip_shared = [] {
+        const char* e = std::getenv("STRATA_SKIP_SHARED");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    // Self-cert for the probe: one line a run, with fo_'s first/last four floats, so the =0 and =1 arms can be
+    // compared on the output itself and not only on the ids (ids equal by chance is the failure mode we check for).
+    if (std::getenv("STRATA_SKIP_SHARED") != nullptr) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            float b[8] = {};
+            ck(cudaStreamSynchronize(cs(st_)), "shared probe");
+            ck(cudaMemcpy(b, fo_, 4 * sizeof(float), cudaMemcpyDeviceToHost), "shared probe");
+            ck(cudaMemcpy(b + 4, fo_ + (size_t) n * n_embd_ - 4, 4 * sizeof(float), cudaMemcpyDeviceToHost),
+               "shared probe");
+            std::fprintf(stderr,
+                         "shared-skip: moe_shared %s (n=%d) fo[0..3]=%.6g %.6g %.6g %.6g fo[last4]=%.6g %.6g %.6g "
+                         "%.6g\n",
+                         skip_shared ? "SKIPPED (probe, output invalid)" : "RUN (control)", n, b[0], b[1], b[2], b[3],
+                         b[4], b[5], b[6], b[7]);
+        }
+    }
+    if (skip_shared) return;
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_SHARED_TIMING");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    if (!on) {
+        moe_shared(L, il, n);
+        return;
+    }
+    // Wall time of the function is launch time (the kernels are async): measure with events and wait, which is fine
+    // for the timing run only.  Decode steps are the calls with n <= 8 (a window); prefill passes thousands.
+    static cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+    if (!ev0) {
+        ck(cudaEventCreate(&ev0), "shared timing");
+        ck(cudaEventCreate(&ev1), "shared timing");
+    }
+    ck(cudaEventRecord(ev0, cs(st_)), "shared timing");
+    moe_shared(L, il, n);
+    ck(cudaEventRecord(ev1, cs(st_)), "shared timing");
+    ck(cudaEventSynchronize(ev1), "shared timing");
+    float ms = 0.f;
+    ck(cudaEventElapsedTime(&ms, ev0, ev1), "shared timing");
+    stats_.shared_ms += (double) ms;
+    if (n <= 8) {
+        stats_.shared_n1_ms += (double) ms;
+        ++stats_.shared_n1;
+    }
+}
+
 void Engine::moe_latent(Layer& L, int n) {
+    // STRATA_SHARED_OVERLAP: the shared expert wrote fo_ on sh_ beside the routed experts' work; that write must
+    // land before the routed sum is added into fo_ (the only other writer).  Off: sh_pending_ is never set.
+    if (sh_pending_) {
+        ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_sh_), "shared expert");
+        sh_pending_ = false;
+    }
     if (!L.latent_up.p) return;
     lin(L.latent_up, moe_out_, moe_up_, n);
     axpy(moe_up_, 1.f, fo_, (size_t) n * n_embd_, true, st_);
@@ -3750,7 +3850,7 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
     // STRATA_STAGE_RING2: the round buffer this copy fills (null: the one staging buffer, as always).
     uint8_t* const dst = base ? base : stage_;
     // the expert's own slot layout (slot_up()/slot_down()), not a gate-and-up width: a non-gated expert (Nemotron)
-    // has no gate and its up is one matrix.  B3, P3-20261016\B3-配方盘点-20261016.md.
+    // has no gate and its up is one matrix.  B3, P3-20261016\B3-閰嶆柟鐩樼偣-20261016.md.
     const size_t gu2 = L.slot_down(), down_at = pad((size_t) m * gu2);
     const int per = (int) (chunk_bytes_ / (gu2 + L.d_bytes));
     const size_t up_at = L.slot_up();          // gated: the up follows the gate; non-gated: 0
@@ -3867,7 +3967,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     }
     ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
 
-    moe_shared(L, il, n);
+    moe_shared_timed(L, il, n);
 
     // read() takes a layer's calls one after the other, so the buffer may hold this layer's experts from the
     // call before (staged_).  The ones copied ahead do not depend on the routing and are this call's too.  A
@@ -4359,7 +4459,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     }
     moe_sum(dx_, d_w, (latent_rows && L.latent_up.p) ? moe_out_ : fo_, out_w, n_used_, n, st_);
     if (n_cpu > 0) moe_add(L, n);
-    // STRATA_STAGE_RING2 (the design's ⑤): the next layer's ahead list goes into the other buffer now, so its copy
+    // STRATA_STAGE_RING2 (the design's 鈶?: the next layer's ahead list goes into the other buffer now, so its copy
     // runs on up_ under this layer's kernels; the next call waits on that slot's event instead of copying it again.
     if (ring) {
         int nxt = il + 1;
@@ -4477,8 +4577,11 @@ void Engine::run(const int32_t* tokens, int n) {
         else layer_head(L, il, m);
         if (!L.moe || batched(L, m)) return;
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
-        if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
-        else moe_shared(L, il, m);
+        // STRATA_SHARED_OVERLAP: its recorded graph would run the shared expert on st_ (beside nothing), so a call
+        // that overlaps takes the direct call - the shared expert on sh_ - instead of the old recording.
+        if (shared_overlap_ && m <= 8 && !all_cached()) moe_shared_timed(L, il, m);
+        else if (replay) replayed(L.shared, rec, [&] { moe_shared_timed(L, il, m); });
+        else moe_shared_timed(L, il, m);
     };
     const auto tail = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
@@ -4618,7 +4721,7 @@ void Engine::run(const int32_t* tokens, int n) {
                     Layer& L = layers_[(size_t) il];
                     layer_head(L, il, n);
                     if (!L.moe) continue;
-                    moe_shared(L, il, n);
+                    moe_shared_timed(L, il, n);
                     moe_card(L, il, n);
                     layer_tail(L, il, n);
                 }
@@ -4740,7 +4843,7 @@ void Engine::layer(int il, int n) {
         moe_rows(L, il, n);
     } else {
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
-        moe_shared(L, il, n);
+        moe_shared_timed(L, il, n);
         if (moe(L, il, n)) moe_add(L, n);
     }
     moe_latent(L, n);
@@ -5052,10 +5155,10 @@ void Engine::keep(int n) {
         const unsigned left = snap_tokens(win_) & ((1u << n) - 1u);   // the right tokens that left their state
         const int from = (int) std::bit_width(left);                  // the tokens the state at hand is after
         // Hard-fail rather than copy: a snapshot that no recurrent layer wrote is not there to return to (an
-        // unrwritten snap_ over 40 Mamba layers would corrupt the state silently).  See t5, 多token端到端-20261016.md.
+        // unrwritten snap_ over 40 Mamba layers would corrupt the state silently).  See t5, 澶歵oken绔埌绔?20261016.md.
         // left == 0 would index snap_ with SIZE_MAX (popcount(0) - 1): a wild pointer, not a state to return to.
         // snap_ok_ is NOT checked here: on a recorded-graph replay the host mamba() does not run (engine.cpp:2486),
-        // so it stays false even though the replayed kernels did write snap_.  See t5-snap修复-20261016.md.
+        // so it stays false even though the replayed kernels did write snap_.  See t5-snap淇-20261016.md.
         if (left == 0) throw std::logic_error("keep: no token of the window left its state to return to");
         ck(cudaMemcpyAsync(state_, snap_ + size_t(std::popcount(left) - 1) * rec_n_, rec_n_ * sizeof(float),
                            cudaMemcpyDeviceToDevice, cs(st_)),

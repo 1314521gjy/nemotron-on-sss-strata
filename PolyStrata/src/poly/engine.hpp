@@ -185,6 +185,10 @@ struct Stats {
     // active_q8*512 + groups*2048 = the sidecar bytes a Stage C kernel would read for them.
     long long r2d_uses = 0, r2d_active = 0, r2d_active_q8 = 0, r2d_groups = 0, r2d_bytes = 0;
     double cpu_ms = 0, route_wait_ms = 0;
+    // STRATA_SHARED_TIMING=1: wall time of the shared expert; shared_n1_ms/shared_n1 are the decode steps (n == 1),
+    // which is what "ms/token" is read from.  Default 0: never filled, nothing printed.
+    double shared_ms = 0, shared_n1_ms = 0;
+    long long shared_n1 = 0;
     /// cpu_ms less what the thread that handed the experts to the card spent: the CPU's own share of the phase, so
     /// that a split's PCIe work does not read as CPU time (an upper bound: the two overlap).
     double cpu_busy_ms = 0;
@@ -408,6 +412,8 @@ protected:
     }
     /// The shared expert, into fo_.  It runs on the GPU while the host routes.
     virtual void moe_shared(const Layer& L, int il, int n) = 0;
+    /// STRATA_SHARED_TIMING=1 only: moe_shared() with its wall time added to Stats (decode steps counted apart).
+    void moe_shared_timed(const Layer& L, int il, int n);
     /// The scores of a layer's router for n tokens, into rl_.  The engine's own: the router's matrix times the
     /// experts' input (xn_).
     virtual void router_scores(const Layer& L, int n);
@@ -476,7 +482,8 @@ protected:
     void draft_rows(const int32_t* tokens, int first, int n);
     const Image* image_at(int64_t row) const;
     bool input(int32_t token, int64_t row, float* dst) const;
-    void lin(const Dev& w, const float* x, float* y, int n, const void* xq = nullptr, int rows_per_x = 0);
+    void lin(const Dev& w, const float* x, float* y, int n, const void* xq = nullptr, int rows_per_x = 0,
+             void* s = nullptr);
     void fill_expert_cache();
     /// A layer's slot: a whole number of blocks of both of the experts' types, so the slots that lie one behind
     /// the other are the matrices of one launch.  fill_expert_cache() sizes the cache with it, and --pcie-frac
@@ -568,6 +575,17 @@ protected:
     std::thread mapper_;                  ///< reads the experts' pages once after load, so they are mapped
     std::atomic<bool> map_quit_{false};
     void* st_ = nullptr;   ///< the stream everything but the staging ahead runs on
+    // STRATA_SHARED_OVERLAP=1: decode's calls (n <= 8 tokens) run the shared expert on a stream of its own, beside
+    // the routed experts' work, and moe_latent() waits for its event before the routed sum is added into fo_.
+    bool shared_overlap_ = false;      ///< the switch took effect (a stream, an event and the block's own rows)
+    void* sh_ = nullptr;               ///< the stream it runs on
+    void* ev_sh_ = nullptr;            ///< marks the end of its two products
+    void* ev_st_ = nullptr;         ///< marks st_ done with xn_ (the head/rms_norm) before sh_ reads it
+    bool sh_pending_ = false;          ///< its event must be waited for before fo_ is added to
+    float* sh_g_ = nullptr;            ///< its up's rows (8 tokens: decode's window top)
+    float* sh_h_ = nullptr;            ///< its relu2's rows
+    void* q8_sh_ = nullptr;            ///< its quantized inputs (lin's scratch, of its own)
+    float* wf_sh_ = nullptr;           ///< its BF16 matrix as floats (lin's scratch, of its own)
     void* blas_ = nullptr; ///< cuBLAS on st_
     void* ev_ = nullptr;   ///< marks the router's copy to the host: ev_row_'s first, or a window's row's own
     void* ev_row_[8] = {}; ///< one for each token a window can have
@@ -795,7 +813,7 @@ protected:
     std::vector<const uint8_t*> exp_up_dev_, exp_down_dev_;
     size_t pin_bytes_ = 0;
     // R56 (Stage B): the neuron-major down sidecar (STRATA_RELU2_DOWN=1).  Mapped read-only, NOT pinned and never
-    // read whole (it is a second 31.7 GB copy; pinning it would push this box past its RAM - R53 §0.3).  Stage B
+    // read whole (it is a second 31.7 GB copy; pinning it would push this box past its RAM - R53 搂0.3).  Stage B
     // only maps it, checks its size against the geometry and four experts' blocks against the GGUF bytes, and lets
     // cpu_experts() build the live-neuron index from it.  No kernel, slot, staging or GGUF pointer reads it.
     const uint8_t* r2d_base_ = nullptr;   ///< the mapping, null unless on

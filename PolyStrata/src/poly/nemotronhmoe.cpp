@@ -382,7 +382,7 @@ void NemotronHMoe::block_attend(int64_t pos, int n) { attn(blocks_[(size_t) n_la
 
 // The block that guesses ahead must be the one llama.cpp's nemotron-h builds for NextN/MTP.  A file that lacks one of
 // its halves is refused loudly here: before this check the block was loaded as a plain MoE layer and the engine
-// drafted from half a block (silent 0-4% acceptance - P3-20261016\回执\R29-MTP保真度-读码-20261018.md).
+// drafted from half a block (silent 0-4% acceptance - P3-20261016\鍥炴墽\R29-MTP淇濈湡搴?璇荤爜-20261018.md).
 void NemotronHMoe::check_draft_block() {
     static const char* const kParts[] = {
         "nextn.eh_proj.weight",   "nextn.enorm.weight",        "nextn.hnorm.weight",
@@ -464,6 +464,32 @@ void NemotronHMoe::route(int il, const float* logits, int32_t, int* ids, float* 
 // The shared expert (llama.cpp nemotron-h.cpp:302-308): it reads the model's width, not the latent, and is not gated
 // (relu2).  It writes fo_; the routed experts' latent sum is mapped in by moe_latent() and added after.
 void NemotronHMoe::moe_shared(const Layer& L, int il, int n) {
+    // STRATA_SHARED_OVERLAP=1: decode's calls (n <= 8 tokens) run both products on sh_, beside the routed experts'
+    // work on st_, and moe_latent() waits for the event before the routed sum is added into fo_ (the only other
+    // writer).  xn_ is only read here - the next write is the next layer's rms_norm, after that wait - and the
+    // block's rows and quantized inputs are its own (sh_g_/sh_h_/q8_sh_), so the routed path's g_/h_/q8_ are
+    // untouched.  Prefill (n >= kStageRows) and the recorded-graph path (all_cached()) keep the old call.
+    // A graph capture on st_ must not have the shared expert's work on another stream: it would be outside the
+    // graph (and the replay would run it on st_ beside nothing).  A capture in progress takes the old path.
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cs(st_), &cap) != cudaSuccess) {
+        cudaGetLastError();
+        cap = cudaStreamCaptureStatusNone;
+    }
+    if (shared_overlap_ && n <= 8 && !all_cached() && L.latent_up.p && cap == cudaStreamCaptureStatusNone) {
+        // st_ owns xn_ until its head/rms_norm is done; sh_ must not read it before.  The event is recorded where
+        // the caller has just finished the layer's head on st_ (moe_shared_timed() is called right after it).
+        ck(cudaEventRecord((cudaEvent_t) ev_st_, cs(st_)), "shared expert");
+        ck(cudaStreamWaitEvent(cs(sh_), (cudaEvent_t) ev_st_, 0), "shared expert");
+        kernels::native_quantize_q8_1(xn_, q8_sh_, n_embd_ * n, 1, sh_);
+        lin(L.sh_up, xn_, sh_g_, n, q8_sh_, 0, sh_);   // {n_embd, n_ff_shexp}
+        relu2(sh_g_, sh_h_, (size_t) n * n_ff_shexp_, sh_);
+        kernels::native_quantize_q8_1(sh_h_, q8_sh_, n_ff_shexp_ * n, 1, sh_);
+        lin(L.sh_down, sh_h_, fo_, n, q8_sh_, 0, sh_);  // {n_ff_shexp, n_embd} -> fo_
+        ck(cudaEventRecord((cudaEvent_t) ev_sh_, cs(sh_)), "shared expert");
+        sh_pending_ = true;
+        return;
+    }
     // xq_ holds the experts' 1024-wide latent rows here (moe_router refilled it), so the 4096-wide sh_up must not
     // read it: pass nullptr and let lin quantize xn_ (n_embd) afresh into q8_ (t2, P3-20261016\t2-cellprobe-20261016.md).
     lin(L.sh_up, xn_, g_, n, nullptr);  // {n_embd, n_ff_shexp}

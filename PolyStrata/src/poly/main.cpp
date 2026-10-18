@@ -957,6 +957,12 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
                      ss.dec_rounds ? wall / (double) ss.dec_rounds : 0.0,
                      ss.dec_rounds ? (double) (st.tokens - ss.at_decode_tokens) / (double) ss.dec_rounds : 0.0, hist,
                      d_miss > 0 ? 1000.0 * (st.pcie_wait_ms - ss.at_decode_pcie_wait_ms) / (double) d_miss : 0.0);
+        if (const char* sht = std::getenv("STRATA_SHARED_TIMING"); sht && sht[0] == '1' && sht[1] == '\0')
+            std::fprintf(stderr,
+                         "shared-timing: shared_ms=%.1f total, decode(n==1) %.1f ms over %lld steps = %.2f "
+                         "ms/token\n",
+                         st.shared_ms, st.shared_n1_ms, (long long) st.shared_n1,
+                         st.shared_n1 ? st.shared_n1_ms / (double) st.shared_n1 : 0.0);
         if (ss.chain_rounds > 0)
             std::fprintf(stderr, "lookup-chain: answer summary: fired in %lld rounds, chained %lld tokens\n",
                          (long long) ss.chain_rounds, (long long) ss.chain_tokens);
