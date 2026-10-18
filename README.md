@@ -150,6 +150,16 @@ copy 交付\p_shipped.txt C:\sp3\p_autolearn.txt
   batch 模式若喂 >N 的长提示同样会中招——交付基准 6,792 < 8,192 才一直没暴露。
 - **验证口径**：必须测"**连续多个长请求**"（第 2、3 条），只测第一条会假绿。
 
+### 6.1c 三号坑：**收尾 token（EOS）集合必须来自模型自己的 tokenizer**
+- **症状**（服务层）：回答在普通文字中间被截断；或反过来该停不停、继续复读提示词。
+- **根因（本仓修的）**：serve/server.py 继承自 Qwen 系靶子 ——
+  ① EOS_IDS = {248044, 248046} 是 **Qwen 的 id**，我们模型 eos = 11、<|im_end|> = 11 ⇒ 请求路径认不出收尾 token；
+  ② stop_ids 里塞了 	okenizer.encode(<|endoftext|>)，可我们词表**没有** <|endoftext|> ⇒ 该字面量被切成
+     **7 个普通文本 token**（11, 1060, 1062, 1124, 1474, 2149, 2935）⇒ **回答里出现这些普通 token 就被当成结束**。
+- **修法**：eos_ids_of(tokenizer) 从 GGUF 的 eos/eot/eom + 单 token 的 <|im_end|> 派生（与引擎 --eos-ids 默认同源），
+  且**任何切碎的字面量一律不进 stop 集合**；启动打印自证行 [strata] end-of-reply ids: 11。
+- **判据（正负控）**：旧逻辑 stop_ids = 7 个（含 6 个普通 id）；新逻辑 = {11}；启动日志必须有该自证行，缺行即补丁没生效。
+
 ### 6.1b 二号坑：**借槽（`STRATA_PROMPT_BORROW`）在"一次进程跑多个请求"下污染缓存**
 - **症状**：`--serve` 下**第一个请求正常、之后全崩**，输出 `<unk>`(id 0) 连续 256 次（logits 被坏缓存算成 NaN ⇒ argmax 恒 0）；
   长提示（28K）+ 长输出时最明显。

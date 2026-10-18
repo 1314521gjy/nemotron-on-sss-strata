@@ -738,7 +738,36 @@ def btrace(*a):
         print("[batch-trace]", threading.get_ident() % 10000, *a, file=sys.stderr, flush=True)
 
 
-EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
+EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: until the tokenizer says (use_tokenizer_eos)
+
+EOS_KEYS = ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id")
+
+
+def eos_ids_of(tokenizer) -> set:
+    """The ids that end a reply, from the model's own tokenizer: its GGUF's eos / eot / eom ids, plus <|im_end|>
+    when the vocabulary carries that token whole.  The engine's --eos-ids default is the same set, so the request
+    path and the engine agree on where a reply ends.  A literal the vocabulary does NOT have must never be added:
+    `tokenizer.encode("<|endoftext|>")` on a model without it returns several ordinary pieces, and stopping on
+    those would end replies in the middle of ordinary text."""
+    ids = set()
+    special = getattr(tokenizer, "special_ids", None) or {}
+    for key in EOS_KEYS:
+        v = special.get(key)
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+            ids.add(v)
+    im_end = tokenizer.encode(IM_END, parse_special=True)
+    if len(im_end) == 1:
+        ids.add(im_end[0])
+    return ids
+
+
+def use_tokenizer_eos(tokenizer) -> None:
+    """EOS_IDS from the model's tokenizer (a model without one keeps the default set)."""
+    global EOS_IDS
+    ids = eos_ids_of(tokenizer)
+    if ids:
+        EOS_IDS = ids
+    print("[strata] end-of-reply ids: %s" % ",".join(str(i) for i in sorted(EOS_IDS)), flush=True)
 
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
@@ -3150,12 +3179,10 @@ class Service:
         end a reply, and how it writes a tool call."""
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))
         im_end = tokenizer.encode(IM_END, parse_special=True)
-        if len(im_end) == 1:
-            self.stop_ids = set(im_end + tokenizer.encode("<|endoftext|>", parse_special=True))
+        if len(im_end) == 1:    # ChatML: <|im_end|> whole, plus the GGUF's own end-of-text / turn / message ids
+            self.stop_ids = set(im_end) | eos_ids_of(tokenizer)
         else:   # not a ChatML model (GLM): the ids its GGUF names for the end of the text, the turn and the message
-            special = getattr(tokenizer, "special_ids", None) or {}
-            self.stop_ids = {special[k] for k in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id",
-                                                  "tokenizer.ggml.eom_token_id") if k in special}
+            self.stop_ids = eos_ids_of(tokenizer)
         # the tokenizer's own tokens under the names a template knows them by (Gemma's starts with bos_token)
         special = getattr(tokenizer, "special_ids", None) or {}
         self.template_tokens = {name: tokenizer.decode([special[key]]) for name, key in (
@@ -7077,6 +7104,7 @@ def main() -> int:
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     tok = load_tokenizer(tpath) or ByteTokenizer()
+    use_tokenizer_eos(tok)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
