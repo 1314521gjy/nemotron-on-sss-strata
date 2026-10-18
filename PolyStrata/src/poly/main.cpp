@@ -329,7 +329,14 @@ struct Session {
         : engine(e), eos(std::move(eos_ids)), flags(f), kept(e, with_floor(f)),
           most(lookup > 0 || e.drafts() ? std::min<int>(e.max_window(), strata::spec::DraftPolicy::kMaxT) : 1),
           look(lookup > 0 && most > 1),
-          repeats(std::max(lookup, 3), 64, (size_t) e.max_context() + 4096), policy(most) {}
+          repeats(std::max(lookup, 3), 64, (size_t) e.max_context() + 4096), policy(most) {
+        // STRATA_DET_WINDOW=1: Guesses fixes the window's depth instead of measuring it; this is the line the
+        // receipts use to prove the mode ran.
+        const char* dw = std::getenv("STRATA_DET_WINDOW");
+        if (dw != nullptr && std::atoi(dw) == 1)
+            std::fprintf(stderr, "strata-poly: deterministic window: fixed depth=%d, gate=always\n",
+                         std::min(most, kBlockWindow) - 1);
+    }
 
     static CacheOptions with_floor(const CacheFlags& f) {
         CacheOptions o = f.o;
@@ -484,6 +491,10 @@ struct Session {
                         if (!guesses.takes(n_d, p, ms_since(asked_at))) break;
                     }
                     use = policy.choose(1 + n_d, k, match);
+                    if (guesses.deterministic()) {   // fixed depth: use every guess the chain produced
+                        use.t = 1 + n_d;
+                        use.lookup = false;
+                    }
                     if (draft_dump > 0 && dump_round < draft_dump && n_d > 0) {
                         dump_now = true;
                         dump_n = n_d;

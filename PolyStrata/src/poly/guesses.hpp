@@ -19,6 +19,7 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace strata::poly {
 
@@ -61,6 +62,15 @@ struct Gate {
 
 class Guesses {
 public:
+    Guesses() {
+        // STRATA_DET_WINDOW=1: the window's depth is fixed at --window instead of being decided from the times
+        // measured so far, so a run's tokens/round, batch shapes and rounding no longer depend on machine load
+        // (R44: tokens/round was 3.56 one run and 3.37 the next, and the ids followed).  Off by default; with no
+        // variable set every branch below is the one it was.
+        const char* e = std::getenv("STRATA_DET_WINDOW");
+        det_ = e != nullptr && std::atoi(e) == 1;
+    }
+    bool deterministic() const { return det_; }
     static constexpr int kFresh = 32;             ///< the rounds for which a time is believed
     /// A token more, of a token alone, where it is not measured: the step of the policy's shape (draft_policy.cpp).
     static constexpr double kUnmeasured = 0.35;
@@ -74,6 +84,7 @@ public:
         asked_ = 0;
         sure_ = tokens_ = 1.0;
         one_ = at_[1] ? ms_[1] : policy.cost_ms(1);   // a token alone is the measure, old or not
+        if (det_) return blocks;                      // every round asks the block: no gate, no throttling
         return blocks && gate.ask();
     }
 
@@ -81,6 +92,7 @@ public:
     bool wants(int n) {
         const int to = n + 2;   // the window's tokens with this guess
         more_ = knows(to) ? std::clamp((ms_[to] - round_ms(to - 1)) / one_, 0.2, 0.5) : kUnmeasured;
+        if (det_) return true;   // fixed depth: the time terms are not consulted
         // asking takes time too: not when a guess the block were sure of would not pay for it
         const double ask = measured_ && fresh(asked_at_) ? ask_ms_ : 0.0;
         return sure_ * round_ms(to - 1) > tokens_ * (more_ * one_ + ask);
@@ -89,6 +101,12 @@ public:
     /// The block's guess after n others, right with probability p; asking took `ms`.  Returns whether it joins
     /// the window.
     bool takes(int n, double p, double ms) {
+        if (det_) {   // every guess joins until the fixed depth: the same window on any machine load
+            ++asked_;
+            sure_ *= p;
+            tokens_ += sure_;
+            return true;
+        }
         ask_ms_ = fresh(asked_at_) ? ask_ms_ + 0.1 * (std::min(ms, 2.0 * ask_ms_) - ask_ms_) : ms;
         asked_at_ = round_;
         ++asked_;
@@ -107,7 +125,7 @@ public:
         ms_[t] = knows(t) ? ms_[t] + 0.1 * (ms - ms_[t]) : ms;
         at_[t] = round_;
         measured_ = true;
-        if (blocks_) gate.saw(asked_ > 0, wrote, ms);
+        if (blocks_ && !det_) gate.saw(asked_ > 0, wrote, ms);
         return ms;
     }
 
@@ -125,6 +143,7 @@ private:
     bool measured_ = false;                          // some round's time is known: asking can be weighed against it
     // of the round
     bool blocks_ = false;
+    bool det_ = false;   ///< STRATA_DET_WINDOW=1: fixed depth, no time terms, the gate always says ask
     int asked_ = 0;
     double one_ = 1.0, more_ = kUnmeasured, sure_ = 1.0, tokens_ = 1.0;
 };
