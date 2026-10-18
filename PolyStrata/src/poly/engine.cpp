@@ -2048,6 +2048,19 @@ void Engine::plan_ahead(Layer& L, int il) {
 
 // The follower: an asked-for expert goes from the mapped file to its pinned buffer, and from there to its slot.
 // The file may have to be read for it, which is why this is not the engine's thread.
+namespace {
+// STRATA_SWAP_DIRECT_FROM_PIN (default 0): a swap of a pinned layer's expert copies the three slot parts straight
+// from the page-locked mapping instead of memcpy -> pinned -> one DMA.  The DMA sources are already resident and
+// registered; this only stops the follower from taking host bandwidth while the decode reads its misses.
+bool swap_direct_from_pin() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_SWAP_DIRECT_FROM_PIN");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
+}  // namespace
+
 void Engine::follow_loop() {
     cudaSetDevice(device_);   // a thread starts on card 0
     affinity::pin_aux_thread();   // --aux-cpus: no-op unless the switch named a processor for this thread
@@ -2069,6 +2082,23 @@ void Engine::follow_loop() {
         if (r2d_base_) {   // gate|up first, then the down materialized T->row straight into the slot
             err = cudaMemcpyAsync(s->slot, s->pinned, L.slot_down(), cudaMemcpyHostToDevice, cs(swap_st_));
             if (err == cudaSuccess) materialize_down(L, s->il, e, s->slot + L.slot_down(), cs(swap_st_));
+        } else if (swap_direct_from_pin() && s->il >= 0 && (size_t) s->il < pin_layer_.size() &&
+                   pin_layer_[(size_t) s->il]) {
+            // #3': the layer's experts live in the pinned GGUF mapping; copy the slot straight from it.  No host
+            // memcpy -> pinned on the follower, so a swap takes no CPU bandwidth and no lock while a miss reads.
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "strata-poly: swap-direct: from the pinned mapping "
+                                     "(STRATA_SWAP_DIRECT_FROM_PIN=1)\n");
+            if (L.gated)
+                err = cudaMemcpyAsync(s->slot, L.exp_gate + e * L.gu_stride, gu, cudaMemcpyHostToDevice,
+                                      cs(swap_st_));
+            if (err == cudaSuccess)
+                err = cudaMemcpyAsync(s->slot + L.slot_up(), L.exp_up + e * L.gu_stride, gu,
+                                      cudaMemcpyHostToDevice, cs(swap_st_));
+            if (err == cudaSuccess)
+                err = cudaMemcpyAsync(s->slot + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes,
+                                      cudaMemcpyHostToDevice, cs(swap_st_));
         } else {
             std::memcpy(s->pinned + L.slot_down(), L.exp_down + e * L.d_bytes, L.d_bytes);
             err = cudaMemcpyAsync(s->slot, s->pinned, L.slot_down() + L.d_bytes, cudaMemcpyHostToDevice,
