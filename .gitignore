@@ -74,4 +74,4 @@ PolyStrata/**/build*/
 !P3-20261016/git/*.txt
 !P3-20261016/git/.commitmsg-PolyStrata.txt
 # 例外：交付物（随包起始表，纯文本，交付级可追踪；lead 2026-10-18 裁定入库）
-!P3-20261016/交付/*.txt
+!交付/*.txt
