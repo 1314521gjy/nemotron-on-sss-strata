@@ -316,6 +316,8 @@ public:
     /// R56 (Stage B): whether STRATA_RELU2_DOWN=1 mapped the neuron-major down sidecar (never a compute path).
     bool relu2_down_on() const { return r2d_base_ != nullptr; }
     int expert_ff() const { return n_ff_exp_; }   ///< R56: a routed expert's hidden width (the sidecar's neurons)
+    /// R57c (D0): the pin budget's handover from the GGUF down half to the sidecar, at the answer's decode boundary.
+    bool relu2_pin_switch();
     uint64_t pin_chunks() const { return pin_chunks_; }
     uint64_t pin_fallback_chunks() const { return pin_fallback_chunks_; }
     uint64_t pin_dmas() const { return pin_dmas_; }

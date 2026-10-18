@@ -589,38 +589,14 @@ void Engine::relu2_down_open() {
         refuse("the sidecar does not match the GGUF's down bytes");
         return;
     }
-    // R57 (Stage C, option B): pin the sidecar read-only, so the decode's down reads are RAM and not page faults.
-    // pin_expert_arena() pinned only the GGUF up half when this switch is on, so the pinned total is the same
-    // 59.06 GiB.  The lead's floor: the sidecar must fit with 8 GiB RAM to spare, or the run refuses loudly.
-    const size_t ram_pre = ram_available();
-    if (ram_pre < expect + ((size_t) 8 << 30)) {
-        std::fprintf(stderr,
-                     "strata-poly: relu2-down REFUSED to pin: %.1f GiB RAM free, needs sidecar %.1f + 8 GiB\n",
-                     (double) ram_pre / (double) (size_t(1) << 30), (double) expect / (double) (size_t(1) << 30));
-        refuse("not enough RAM to pin the sidecar with an 8 GiB floor");
-        return;
-    }
-    const cudaError_t pr = cudaHostRegister((void*) r2d_base_, r2d_bytes_, cudaHostRegisterReadOnly);
-    if (pr != cudaSuccess) {
-        cudaGetLastError();
-        refuse("sidecar cudaHostRegisterReadOnly failed: " + std::string(cudaGetErrorString(pr)));
-        return;
-    }
-    r2d_pinned_ = true;
-    const size_t ram_post = ram_available();
-    if (ram_post < ((size_t) 8 << 30)) {
-        cudaHostUnregister((void*) r2d_base_);
-        r2d_pinned_ = false;
-        refuse("less than 8 GiB RAM left after pinning the sidecar");
-        return;
-    }
+    // R57c (D0): the sidecar is NOT pinned here.  Prefill runs with the delivery's usual pin inventory (the GGUF's
+    // up AND down halves, pinned by pin_expert_arena()), and the down half's pin changes hands at the decode
+    // boundary in relu2_pin_switch().  Only the four check experts have been touched (6.2 MB): this is a mapping.
     std::fprintf(stderr,
-                 "strata-poly: relu2-down: sidecar PINNED (%.2f GiB), up pinned (%.2f GiB), avail %.1f GiB, "
-                 "mmap %.3f GiB, ON-LOAD CHECK %d/%d experts == GGUF (0 diff), touched %.1f MB, WS +%.1f MB, "
-                 "%.1f ms\n",
-                 (double) expect / (double) (size_t(1) << 30), (double) pin_bytes_ / (double) (size_t(1) << 30),
-                 (double) ram_post / (double) (size_t(1) << 30), (double) expect / (double) (size_t(1) << 30), okv,
-                 okv + badv, (double) touched / 1e6, (double) (mem1.ws - mem0.ws) / 1e6, ms_since(t0));
+                 "strata-poly: relu2-down: sidecar mapped %.3f GiB (deferred: pinned at the decode switch), "
+                 "ON-LOAD CHECK %d/%d experts == GGUF (0 diff), touched %.1f MB, WS +%.1f MB, %.1f ms\n",
+                 (double) expect / (double) (size_t(1) << 30), okv, okv + badv, (double) touched / 1e6,
+                 (double) (mem1.ws - mem0.ws) / 1e6, ms_since(t0));
 }
 
 Engine::~Engine() {
@@ -1286,14 +1262,9 @@ void Engine::pin_expert_arena() {
     const char* env = std::getenv("STRATA_PIN_ARENA_GIB");
     const double gib = env ? std::atof(env) : 0.0;
     if (gib <= 0) return;
-    // R57 (Stage C, option B): with STRATA_RELU2_DOWN=1 the pin budget is split - the GGUF up half stays pinned
-    // here (staging, fill and swap keep DMAing it directly), and relu2_down_open() pins the 29.53 GiB neuron-major
-    // down sidecar in its place, so the pinned total is the same 59.06 GiB.  With the switch off nothing changes:
-    // both halves are pinned exactly as before.
-    static const bool sidecar = [] {
-        const char* e = std::getenv("STRATA_RELU2_DOWN");
-        return e != nullptr && std::atoi(e) != 0;
-    }();
+    // R57c (D0): the pin inventory is UNCHANGED here - the GGUF's up AND down halves are page-locked exactly as the
+    // delivery always had them, so prefill stages both directly.  The down half's pin changes hands later, at the
+    // decode boundary only (relu2_pin_switch(), STRATA_RELU2_DOWN=1).
     const size_t budget = (size_t) (gib * (double) (size_t(1) << 30));
     const size_t ram_before = ram_available();
     // The user's floor: keep every expert in memory.  A full 40-layer pin is 59.06 GiB (40 x 1.4766); with this
@@ -1312,7 +1283,7 @@ void Engine::pin_expert_arena() {
         Layer& L = layers_[il];
         if (!L.moe || !L.exp_up || !L.exp_down) continue;
         const size_t up_len = (size_t) n_expert_ * L.gu_stride;
-        const size_t dn_len = sidecar ? 0 : (size_t) n_expert_ * L.d_bytes;
+        const size_t dn_len = (size_t) n_expert_ * L.d_bytes;
         const size_t gt_len = L.exp_gate ? (size_t) n_expert_ * L.gu_stride : 0;
         if (used + up_len + dn_len + gt_len > budget) break;   // whole layers only
         bool good = true;
@@ -1327,7 +1298,7 @@ void Engine::pin_expert_arena() {
             if (r != cudaSuccess) { cudaGetLastError(); good = false; }
         };
         reg(L.exp_up, up_len, "up");
-        if (good && !sidecar) reg(L.exp_down, dn_len, "down");
+        if (good) reg(L.exp_down, dn_len, "down");
         if (good && L.exp_gate) reg(L.exp_gate, gt_len, "gate");
         if (!good) { ++bad; break; }   // the failed register was printed above; keep what succeeded
         pin_layer_[il] = 1;
@@ -1336,12 +1307,113 @@ void Engine::pin_expert_arena() {
     }
     pin_bytes_ = used;
     std::fprintf(stderr,
-                 "strata-poly: STRATA_PIN_ARENA_GIB=%.1f%s: pinned %d layers (%.2f GiB) of %zu, %d refused; "
+                 "strata-poly: STRATA_PIN_ARENA_GIB=%.1f: pinned %d layers (%.2f GiB) of %zu, %d refused; "
                  "RAM %.1f -> %.1f GiB free; took %.0f ms\n",
-                 gib, sidecar ? " (option B: up half only; the sidecar is pinned in its place)" : "", ok,
-                 (double) used / (double) (size_t(1) << 30), layers_.size(), bad,
+                 gib, ok, (double) used / (double) (size_t(1) << 30), layers_.size(), bad,
                  (double) ram_before / (double) (size_t(1) << 30),
                  (double) ram_available() / (double) (size_t(1) << 30), ms_since(t0));
+}
+
+// R57c (D0): the pin budget changes hands at the decode boundary.  Prefill runs exactly as the delivery always has:
+// the GGUF's up AND down halves are page-locked (pin_expert_arena()) and staged directly, so prefill is unchanged.
+// Before the answer's decode starts, the down half's 29.53 GiB of pin is given up and the same amount pins the
+// neuron-major sidecar, which the CPU down kernel then reads in place (relu2_down_t.hpp).  The up half's pin never
+// moves.  With STRATA_RELU2_DOWN off nothing here ever runs; a failure here is loud and leaves the decode on the
+// GGUF down path (bit-identical), only slower.
+bool Engine::relu2_pin_switch() {
+    if (r2d_base_ == nullptr || r2d_pinned_) return false;
+    if (!exp_down_dev_.empty()) {
+        std::fprintf(stderr,
+                     "strata-poly: pin switch: REFUSED with --pcie-mode direct (its device aliases point into the "
+                     "down half); decode keeps the GGUF down path\n");
+        return false;
+    }
+    if (pin_layer_.empty() || pin_bytes_ == 0) {
+        std::fprintf(stderr, "strata-poly: pin switch: the GGUF experts are not pinned; the sidecar stays unpinned "
+                             "(decode reads will page fault)\n");
+        return false;
+    }
+    const Clock::time_point t0 = Clock::now();
+    int n_un = 0, bad = 0;
+    size_t freed = 0;
+    for (size_t il = 0; il < layers_.size() && il < pin_layer_.size(); ++il) {
+        if (!pin_layer_[il]) continue;
+        const Layer& L = layers_[il];
+        const cudaError_t r = cudaHostUnregister((void*) L.exp_down);
+        if (r != cudaSuccess) {
+            cudaGetLastError();
+            ++bad;
+        } else {
+            ++n_un;
+            freed += (size_t) n_expert_ * L.d_bytes;
+        }
+    }
+    if (bad != 0) std::fprintf(stderr, "strata-poly: pin switch: %d down ranges refused to unregister\n", bad);
+    // R57c-fix: cudaHostRegisterReadOnly does NOT fault a file mapping's pages in (R57 §8: the first switch took
+    // 567 ms and avail did not move, so the decode still page-faulted every sidecar read).  Touch one byte of every
+    // 4 KiB page of the sidecar before registering it: that faults the whole 29.53 GiB in (the pages we just let go
+    // of, the GGUF down half, are what Windows reclaims for them), and the registration then pins resident pages.
+    // One-time per process, done at the decode boundary; the workers split it so the NVMe is not read single-file.
+    const size_t ram_before_fault = ram_available();
+    const Clock::time_point t_pre = Clock::now();
+    const auto touch = [&](size_t lo, size_t hi) {
+        volatile uint8_t seen = 0;
+        for (size_t at = lo; at < hi; at += 4096) seen = (uint8_t) (seen + r2d_base_[at]);
+        if (hi > lo) seen = (uint8_t) (seen + r2d_base_[hi - 1]);
+    };
+    const int nsl = workers_ ? std::max(1, workers_->threads()) : 1;
+    const size_t step = (r2d_bytes_ + (size_t) nsl - 1) / (size_t) nsl;
+    if (workers_ && nsl > 1) {
+        workers_->run(nsl, [&](int i) {
+            const size_t lo = std::min(r2d_bytes_, (size_t) i * step);
+            touch(lo, std::min(r2d_bytes_, lo + step));
+        });
+    } else {
+        touch(0, r2d_bytes_);
+    }
+    const double pre_ms = ms_since(t_pre);
+    const size_t ram_after_fault = ram_available();
+    const double drop_gib =
+        ((double) ram_before_fault - (double) ram_after_fault) / (double) (size_t(1) << 30);
+    std::fprintf(stderr,
+                 "strata-poly: pin switch: faulted-in %.3f GiB sidecar in %.0f ms, avail before/after = %.1f/%.1f GiB "
+                 "(drop %.1f GiB)\n",
+                 (double) r2d_bytes_ / (double) (size_t(1) << 30), pre_ms,
+                 (double) ram_before_fault / (double) (size_t(1) << 30),
+                 (double) ram_after_fault / (double) (size_t(1) << 30), drop_gib);
+    if (drop_gib < 20.0) {
+        std::fprintf(stderr,
+                     "strata-poly: pin switch: FAULT-IN DID NOT RESIDE (avail drop %.1f GiB < 20) -- the sidecar pages "
+                     "are not in RAM; decode keeps the GGUF down path (bit-identical)\n",
+                     drop_gib);
+        return false;
+    }
+    const cudaError_t pr = cudaHostRegister((void*) r2d_base_, r2d_bytes_, cudaHostRegisterReadOnly);
+    if (pr != cudaSuccess) {
+        cudaGetLastError();
+        std::fprintf(stderr,
+                     "strata-poly: pin switch: sidecar cudaHostRegisterReadOnly FAILED: %s -- decode keeps the GGUF "
+                     "down path (bit-identical), the sidecar stays unpinned\n",
+                     cudaGetErrorString(pr));
+        return false;
+    }
+    r2d_pinned_ = true;
+    const size_t ram_post = ram_available();
+    std::fprintf(stderr,
+                 "strata-poly: pin switch: gguf-down unpinned (%d ranges, %.2f GiB), sidecar PINNED (%.2f GiB), "
+                 "total %.1f ms, avail now %.1f GiB\n",
+                 n_un, (double) freed / (double) (size_t(1) << 30), (double) r2d_bytes_ / (double) (size_t(1) << 30),
+                 ms_since(t0), (double) ram_post / (double) (size_t(1) << 30));
+    if (ram_post < ((size_t) 8 << 30)) {
+        std::fprintf(stderr,
+                     "strata-poly: pin switch: REFUSED (only %.1f GiB RAM free after the switch, the floor is 8 GiB); "
+                     "the sidecar goes unpinned and the decode reads page-fault\n",
+                     (double) ram_post / (double) (size_t(1) << 30));
+        cudaHostUnregister((void*) r2d_base_);
+        r2d_pinned_ = false;
+        return false;
+    }
+    return true;
 }
 
 // A slot is a whole number of blocks of both of the experts' types, so the slots of a layer that lie one behind
@@ -3244,41 +3316,6 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
         const size_t c = (size_t) std::min(per, m - j0);
         if (pin) {
             ++pin_chunks_;
-            if (r2d_base_ != nullptr) {
-                // R57 (Stage C, option B): the up half is pinned here but the down half is not (the pin budget went
-                // to the sidecar), so the downs are gathered into the pinned staging buffer and DMAed, while the
-                // ups (and a gate) still go straight from the registered mapping.
-                stage_turn_ ^= 1;
-                uint8_t* h = h_stage_[stage_turn_];
-                const cudaEvent_t left = (cudaEvent_t) ev_stage_[stage_turn_];
-                ck(cudaEventSynchronize(left), "expert staging");
-                const auto gather = [&](int j) {
-                    const size_t e = (size_t) experts[(size_t) j0 + j];
-                    std::memcpy(h + (size_t) j * L.d_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
-                };
-                (alone ? *stagers_ : *workers_).run((int) c, gather);
-                for (size_t j = 0; j < c; ++j) {
-                    const size_t e = (size_t) experts[(size_t) j0 + (int) j];
-                    const size_t at = (size_t) (j0 + (int) j) * gu2;
-                    if (L.gated) {
-                        ck(cudaMemcpyAsync(dst + at, L.exp_gate + e * L.gu_stride, L.gu_bytes,
-                                           cudaMemcpyHostToDevice, cs(stream)),
-                           "expert staging");
-                        pin_dma_bytes_ += L.gu_bytes;
-                        ++pin_dmas_;
-                    }
-                    ck(cudaMemcpyAsync(dst + at + up_at, L.exp_up + e * L.gu_stride, L.gu_bytes,
-                                       cudaMemcpyHostToDevice, cs(stream)),
-                       "expert staging");
-                    pin_dma_bytes_ += L.gu_bytes;
-                    ++pin_dmas_;
-                }
-                ck(cudaMemcpyAsync(dst + down_at + (size_t) j0 * L.d_bytes, h, c * L.d_bytes,
-                                   cudaMemcpyHostToDevice, cs(stream)),
-                   "expert staging");
-                ck(cudaEventRecord(left, cs(stream)), "expert staging");
-                continue;
-            }
             for (size_t j = 0; j < c; ++j) {
                 const size_t e = (size_t) experts[(size_t) j0 + (int) j];
                 const size_t at = (size_t) (j0 + (int) j) * gu2;

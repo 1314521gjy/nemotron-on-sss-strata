@@ -446,6 +446,10 @@ struct Session {
         engine.prompt_borrow_end();   // STRATA_PROMPT_BORROW: the lent slots' experts go back; its time is prompt time
         r.prompt_ms = ms_since(t0);
         if (std::strcmp(r.finish, "cancel") == 0) return r;
+        // R57c (D0): the pin budget changes hands here, after prefill (which ran on the delivery's pin inventory)
+        // and before the answer's decode (which reads the pinned neuron-major sidecar).  Its time is its own line,
+        // not prompt time; with STRATA_RELU2_DOWN off this does nothing.
+        engine.relu2_pin_switch();
         {
             const strata::poly::Stats& at_decode = engine.stats();
             at_decode_cpu_experts = at_decode.cpu_experts;
