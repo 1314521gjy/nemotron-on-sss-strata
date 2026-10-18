@@ -26,8 +26,16 @@ namespace {
 // Rows of gate and up, and of down, a task.  With fewer tasks than several a thread, the last round left threads
 // idle at the end of every layer: 64 rows gave Tiel's 512-row experts 8 tasks each, and its down products 32 tasks.
 // R36: 32 -> 64 for the up rows (the row kernels below decode an expert's weights once for several uses, so longer
-// runs per task pay; the arithmetic is unchanged).
-constexpr int kRowsPerTask = 64;
+// runs per task pay; the arithmetic is unchanged).  R41: STRATA_POLY_CPU_ROWS=96|128 gives a thread a longer
+// contiguous range, so the hardware prefetcher streams the weights; the default stays 64.
+int rows_per_task() {
+    static const int rows = [] {
+        const char* e = std::getenv("STRATA_POLY_CPU_ROWS");
+        const int r = e ? std::atoi(e) : 64;
+        return r >= 16 && r <= 512 ? r : 64;
+    }();
+    return rows;
+}
 constexpr int kRowsPerDownTask = 16;
 constexpr int kSpinsBeforeSleep = 20000;   // about a millisecond of pause instructions
 
@@ -196,6 +204,15 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         const char* e = std::getenv("STRATA_POLY_CPU_KERNELS");
         return e != nullptr && std::atoi(e) != 0 && strata::kernels::cpu::cpu_avx2_ok();
     }();
+    // R41: memory-level parallelism for the CPU expert leg.  The weights are streamed from DRAM at ~32 GB/s, and the
+    // per-row dots expose that latency one row at a time; prefetching the next rows and keeping four rows in flight
+    // gives a thread enough outstanding loads to cover it.  Only the order the loads are issued in changes: every
+    // value is still the same vec_dot's, so the ids stay bit-identical.  Off by default: STRATA_POLY_MLP=1 turns it
+    // on, so the release path (no variable set) is the one the engine gave before it existed.
+    static const bool mlp = [] {
+        const char* e = std::getenv("STRATA_POLY_MLP");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
     // Only the Q4_K up rows: kq256_rows is bit-exact against ggml's per-token dot here (poly_cpu_kernel_parity).
     // The IQ4_NL down rows have an AVX-2/VNNI row kernel too, but it is NOT bit-exact (it rounds differently alone
     // than in a group - native_expert.cpp's #152 note; the tree's own parity holds it to rel <= 1e-5 against ggml),
@@ -242,7 +259,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     float* hp = h.data();
     const int* byp = by.data();
     const int* runp = run.data();
-    const int gu_tasks = (n_ff + kRowsPerTask - 1) / kRowsPerTask;
+    const int gu_tasks = (n_ff + rows_per_task() - 1) / rows_per_task();
     const int first = meanwhile ? 1 : 0;   // task 0, so it is taken at once
     workers.run(first + n_run * gu_tasks, [&](int t) {
         if (t < first) return (*meanwhile)();
@@ -250,7 +267,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         const int i0 = runp[t / gu_tasks], i1 = runp[t / gu_tasks + 1];
         const CpuExpert& e = experts[byp[i0]];
         const bool gated = e.gate != nullptr;   // a latent MoE's experts have no gate
-        const int r0 = (t % gu_tasks) * kRowsPerTask, r1 = std::min(n_ff, r0 + kRowsPerTask);
+        const int r0 = (t % gu_tasks) * rows_per_task(), r1 = std::min(n_ff, r0 + rows_per_task());
         if (fast && !gated) {
             // the run's up rows in one multi-token kernel: the expert's weights decode once for every use of it
             const int nu = i1 - i0;
@@ -273,7 +290,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
             }
             return;
         }
-        for (int r = r0; r < r1; ++r) {
+        const auto one_up_row = [&](int r) {
             const uint8_t* gate = gated ? e.gate + (size_t) r * gu_row : nullptr;
             const uint8_t* up = e.up + (size_t) r * gu_row;
             for (int i = i0; i < i1; ++i) {
@@ -296,7 +313,22 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
                 u = std::clamp(u, -limit, limit);
                 hp[(size_t) j * n_ff + r] = g / (1.f + std::exp(-g)) * u;
             }
+        };
+        if (mlp) {
+            // four rows in flight: the next block's weights are brought in while this one is dotted, so a thread has
+            // several rows' loads outstanding instead of one row's (the values are the same vec_dots)
+            constexpr int kAhead = 4;
+            for (int r = r0; r < r1; r += kAhead) {
+                const int re = std::min(r + kAhead, r1);
+                for (int q = r + kAhead; q < std::min(r + 2 * kAhead, r1); ++q) {
+                    _mm_prefetch((const char*) (e.up + (size_t) q * gu_row), _MM_HINT_T0);
+                    if (gated) _mm_prefetch((const char*) (e.gate + (size_t) q * gu_row), _MM_HINT_T0);
+                }
+                for (int q = r; q < re; ++q) one_up_row(q);
+            }
+            return;
         }
+        for (int r = r0; r < r1; ++r) one_up_row(r);
     });
     uint8_t* hqp = hq.data();
     const auto hq_from = traits(td->vec_dot_type)->from_float;
@@ -308,7 +340,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         one.resize((size_t) n);
         float* s = one.data();
         const int r0 = t * kRowsPerDownTask, r1 = std::min(out_w, r0 + kRowsPerDownTask);
-        for (int r = r0; r < r1; ++r) {
+        const auto one_down_row = [&](int r) {
             for (int u = 0; u < n_run; ++u) {
                 const uint8_t* down = experts[byp[runp[u]]].down + (size_t) r * d_row;
                 for (int i = runp[u]; i < runp[u + 1]; ++i)
@@ -321,7 +353,22 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
                 for (; j < n && experts[j].row == row; ++j) acc += experts[j].weight * s[j];
                 out[(size_t) row * out_w + r] = acc;
             }
+        };
+        if (mlp) {
+            // four rows in flight, the next block's rows prefetched for every expert run in this task: the down
+            // weights of one row are 2.7 KB, four rows' 10.6 KB - enough loads in flight to cover DRAM latency
+            // while the dots of the current block are computed (the values are the same vec_dots)
+            constexpr int kAhead = 4;
+            for (int r = r0; r < r1; r += kAhead) {
+                const int re = std::min(r + kAhead, r1);
+                for (int q = r + kAhead; q < std::min(r + 2 * kAhead, r1); ++q)
+                    for (int u = 0; u < n_run; ++u)
+                        _mm_prefetch((const char*) (experts[byp[runp[u]]].down + (size_t) q * d_row), _MM_HINT_T0);
+                for (int q = r; q < re; ++q) one_down_row(q);
+            }
+            return;
         }
+        for (int r = r0; r < r1; ++r) one_down_row(r);
     });
 }
 

@@ -61,9 +61,10 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 // A save is a file of some 40 KB and a rename.
 constexpr double kProfileSaveMs = 10000.0;
 
-// The most tokens of a window whose guesses are the block's: the token the model has and three guesses, each
-// from the one before.  A repeat of the conversation may fill a longer window (Options::window).
-constexpr int kBlockWindow = 4;
+// The most tokens of a window whose guesses are the block's: the token the model has and up to seven guesses, each
+// from the one before (R40: 4 -> 8, so the block's chain is not cut at three guesses).  A repeat of the conversation
+// may fill a longer window (Options::window).
+constexpr int kBlockWindow = 8;
 
 // A window longer than that is for a copy: a repeat of the conversation whose match is this many tokens or more.
 // A repeat of a few tokens is in any text, and what followed it there is seldom what follows here for long.
@@ -310,7 +311,7 @@ struct Session {
     double at_decode_cpu_ms = 0;
     // Compile #2: the same for the split's counters and for the CPU's own share of the expert phase
     double at_decode_cpu_busy_ms = 0;
-    int64_t at_decode_pcie_experts = 0, at_decode_pcie_dmas = 0;
+    int64_t at_decode_pcie_experts = 0, at_decode_pcie_dmas = 0, at_decode_pcie_direct = 0;
     size_t at_decode_pcie_dma_bytes = 0;
     long long asked = 0, reused = 0;   // prompt tokens of every request, and those of them not read again
     // Guesses at the tokens to come, checked a window at a time (Engine::window).  They come from the block some
@@ -422,6 +423,7 @@ struct Session {
             at_decode_cpu_busy_ms = at_decode.cpu_busy_ms;
             at_decode_pcie_experts = at_decode.pcie_experts;
             at_decode_pcie_dmas = at_decode.pcie_dmas;
+            at_decode_pcie_direct = at_decode.pcie_direct;
             at_decode_pcie_dma_bytes = at_decode.pcie_dma_bytes;
         }
 
@@ -788,12 +790,13 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
     const double d_busy_ms = st.cpu_busy_ms - ss.at_decode_cpu_busy_ms;
     const int64_t d_pcie = st.pcie_experts - ss.at_decode_pcie_experts;
     const int64_t d_pcie_dmas = st.pcie_dmas - ss.at_decode_pcie_dmas;
+    const int64_t d_pcie_direct = st.pcie_direct - ss.at_decode_pcie_direct;
     const double d_pcie_gb = (double) (st.pcie_dma_bytes - ss.at_decode_pcie_dma_bytes) / 1e9;
     std::fprintf(stderr, "decode: cpu_busy_us/miss=%.1f " "\xc2\xb7" " cpu_wall_us/miss=%.1f " "\xc2\xb7"
-                         " pcie=%.2f experts/token (%lld DMAs, %.2f GB)\n",
+                         " pcie=%.2f experts/token (%lld DMAs, %.2f GB, %lld direct)\n",
                  d_miss > 0 ? 1000.0 * d_busy_ms / (double) d_miss : 0.0,
                  d_miss > 0 ? 1000.0 * d_cpu_ms / (double) d_miss : 0.0, (double) d_pcie / (double) d_tok,
-                 (long long) d_pcie_dmas, d_pcie_gb);
+                 (long long) d_pcie_dmas, d_pcie_gb, (long long) d_pcie_direct);
     return 0;
 }
 
@@ -884,6 +887,7 @@ void usage() {
                  "                         share; the staging slots come out of the expert cache's arena\n"
                  "  --pcie-slots N        staging slots for that split (default 16)\n"
                  "  --pcie-auto           Compile #3's share fitting: parsed here, nothing uses it yet\n"
+                 "  --pcie-mode M         dma|direct|auto: how the split's experts reach the card; default dma\n"
                  "environment: STRATA_ROUTE_TAIL_SKIP=N  in place of --tail-skip (0 turns it off)\n");
 }
 
@@ -945,6 +949,7 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(val());
         else if (a == "--pcie-slots") o.pcie_slots = std::atoi(val());
         else if (a == "--pcie-auto") o.pcie_auto = true;
+        else if (a == "--pcie-mode") o.pcie_mode = val();
         else if (a == "--layer-split") o.layer_split = val();
         else if (a == "--draft-vocab") o.draft_vocab = std::atoi(val());
         else if (a == "--draft-dump") o.draft_dump = std::atoi(val());

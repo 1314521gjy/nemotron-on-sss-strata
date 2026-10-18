@@ -101,6 +101,11 @@ struct Options {
     double pcie_frac = 0.0;
     int pcie_slots = 16;          ///< staging slots for that split; 0 refuses one
     bool pcie_auto = false;       ///< Compile #3's share-fitting; parsed here, nothing uses it yet
+    /// --pcie-mode: how a split's experts reach the card.  "dma" (the default): copied into the staging slots, then
+    /// the kernels read the slots.  "direct": the kernels read the pinned host mapping where it is - no copy, no
+    /// staging slot, no event (Strata's zero-copy half of the split).  "auto": direct where the card maps host
+    /// memory into its address space, dma otherwise.
+    std::string pcie_mode = "dma";
 };
 
 /// A thing a model's file may call by other names than the engine does: converters differ.
@@ -162,6 +167,7 @@ struct Stats {
     int64_t tail_experts = 0;      ///< a token's experts left out by Options::tail_skip
     // --pcie-frac: the miss uses that came over PCIe to the GPU instead of the CPU, and the copies that took them there
     int64_t pcie_experts = 0, pcie_dmas = 0;
+    int64_t pcie_direct = 0;   ///< the split's uses read in place (--pcie-mode direct): no copy at all
     size_t pcie_dma_bytes = 0;
     double cpu_ms = 0, route_wait_ms = 0;
     /// cpu_ms less what the thread that handed the experts to the card spent: the CPU's own share of the phase, so
@@ -706,6 +712,7 @@ protected:
     size_t pcie_slot_bytes_ = 0;
     void* pcie_st_ = nullptr;   ///< the copies run on it, beside the CPU's work
     void* ev_pcie_ = nullptr;   ///< marks the last of them: the compute stream waits for it before the split's experts
+    bool pcie_direct_ = false;  ///< --pcie-mode direct (or auto that found it works): the kernels read the host mapping
     int stage_turn_ = 0;
     std::vector<int32_t> ids_, count_, first_, group_, round_;
     std::vector<float> route_tmp_;   ///< route()'s scratch, a share for each host thread
@@ -714,6 +721,9 @@ protected:
     };
     std::vector<Run> runs_;        ///< a layer's launches over cached experts whose slots lie one behind the other
     std::vector<uint8_t> pin_layer_;   ///< per layer: 1 when its expert sources are pinned (STRATA_PIN_ARENA_GIB)
+    /// --pcie-mode direct: the device aliases of those pinned regions (cudaHostGetDevicePointer), so the split's
+    /// kernels can read the mapping in place.  Null on the layers that are not pinned or when direct is off.
+    std::vector<const uint8_t*> exp_up_dev_, exp_down_dev_;
     size_t pin_bytes_ = 0;
     uint64_t pin_chunks_ = 0, pin_fallback_chunks_ = 0;   ///< stage() chunks taking the direct DMA / the old gather
     uint64_t pin_dmas_ = 0; size_t pin_dma_bytes_ = 0;    ///< the direct path's DMA count and bytes (size check)

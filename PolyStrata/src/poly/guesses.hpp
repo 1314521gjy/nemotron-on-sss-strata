@@ -38,13 +38,18 @@ struct Gate {
     long long rounds = 0;
     bool pays = true;
 
+    // R40: the bill is per token, not per round.  The rounds that asked the block wrote tokens[1] tokens in ms[1],
+    // the rounds that did not wrote tokens[0] in ms[0]; a window that writes a token at least as fast keeps the
+    // block.  The old rule also put a paying round that was not a tenth ahead on only every 24th (every 96th when
+    // further ahead) - that throttle is what cut the window depth to 1.26 guesses a round.
     bool ask() {
         ++rounds;
         if (seen[1] < 16) return true;
         if (seen[0] < 4) return false;
-        const double with = tokens[1] * ms[0], without = tokens[0] * ms[1];   // the two rates, over one divisor
+        const double with = tokens[1] / (ms[1] > 0.0 ? ms[1] : 1e-9);       // tokens a ms, a round with the block
+        const double without = tokens[0] / (ms[0] > 0.0 ? ms[0] : 1e-9);    // and a round without it
         pays = with >= without;
-        return rounds % (!pays ? 8 : with > 1.1 * without ? 96 : 24) == 0 ? !pays : pays;
+        return pays || rounds % 8 == 0;
     }
     void saw(bool asked, int n, double round_ms) {
         if (++seen[asked] <= 8 && asked) return;
@@ -75,7 +80,7 @@ public:
     /// Whether the block is asked for a guess more, the window having n of them.
     bool wants(int n) {
         const int to = n + 2;   // the window's tokens with this guess
-        more_ = knows(to) ? std::clamp((ms_[to] - round_ms(to - 1)) / one_, 0.2, 0.8) : kUnmeasured;
+        more_ = knows(to) ? std::clamp((ms_[to] - round_ms(to - 1)) / one_, 0.2, 0.5) : kUnmeasured;
         // asking takes time too: not when a guess the block were sure of would not pay for it
         const double ask = measured_ && fresh(asked_at_) ? ask_ms_ : 0.0;
         return sure_ * round_ms(to - 1) > tokens_ * (more_ * one_ + ask);

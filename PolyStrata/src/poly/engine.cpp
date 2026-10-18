@@ -1036,8 +1036,12 @@ void Engine::pin_expert_arena() {
         const size_t gt_len = L.exp_gate ? (size_t) n_expert_ * L.gu_stride : 0;
         if (used + up_len + dn_len + gt_len > budget) break;   // whole layers only
         bool good = true;
+        // --pcie-mode direct: the kernels read these bytes themselves, so the registration must also map them into
+        // the device's address space (cudaHostRegisterMapped) - a registration for the staging DMA need not.
+        const bool for_direct = opt_.pcie_mode == "direct" || opt_.pcie_mode == "auto";
+        const unsigned reg_flags = cudaHostRegisterReadOnly | (for_direct ? cudaHostRegisterMapped : 0u);
         const auto reg = [&](const uint8_t* p, size_t n, const char* what) {
-            const cudaError_t r = cudaHostRegister((void*) p, n, cudaHostRegisterReadOnly);
+            const cudaError_t r = cudaHostRegister((void*) p, n, reg_flags);
             std::fprintf(stderr, "strata-poly: pin %s layer %zu: %.1f MB -> %s (%d)\n", what, il,
                          (double) n / (double) (size_t(1) << 20), cudaGetErrorString(r), (int) r);
             if (r != cudaSuccess) { cudaGetLastError(); good = false; }
@@ -1502,6 +1506,8 @@ void Engine::load(const Options& o) {
     if (opt_.pcie_slots < 0 || opt_.pcie_slots > 256) throw std::runtime_error("--pcie-slots is 0 to 256");
     if (opt_.pcie_frac > 0.0 && opt_.pcie_slots < 1)
         throw std::runtime_error("--pcie-frac above 0 needs at least one --pcie-slots slot");
+    if (opt_.pcie_mode != "dma" && opt_.pcie_mode != "direct" && opt_.pcie_mode != "auto")
+        throw std::runtime_error("--pcie-mode is dma, direct or auto");
     if (opt_.adapt_min_gain != kSwapMinDefault || opt_.swap_half != kSwapHalfDefault ||
         opt_.swap_ratio != kSwapRatioDefault)
         std::fprintf(stderr, "strata-poly: adaptive tier: min gain %.3f, half %d tokens, ratio %.3f\n",
@@ -1763,6 +1769,70 @@ void Engine::alloc() {
     h_wlogits_ = (float*) hmalloc(size_t(opt_.window) * n_vocab_ * sizeof(float), "pinned memory");
     alloc_caches();
     pin_expert_arena();   // STRATA_PIN_ARENA_GIB: the expert sources, registered read-only for stage()'s direct DMA
+    // --pcie-mode direct (Strata's zero-copy half of the split): the kernels read the pinned host mapping where it
+    // is, so the card must map host memory into its address space (cudaHostRegisterReadOnly asks for that) and the
+    // pointer must be a device address as it is (UVA).  Probed once here; "auto" falls back to dma, "direct" refuses.
+    if (opt_.pcie_frac > 0.0 && (opt_.pcie_mode == "direct" || opt_.pcie_mode == "auto")) {
+        int uva = 0;
+        ck(cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device_), "cudaDeviceGetAttribute");
+        bool ok = uva == 1;
+        const Layer* probe = nullptr;
+        for (const Layer& L : layers_)
+            if (L.moe && L.exp_up) {
+                probe = &L;
+                break;
+            }
+        if (ok && probe) {
+            void* dp = nullptr;
+            const cudaError_t r = cudaHostGetDevicePointer(&dp, (void*) probe->exp_up, 0);
+            cudaPointerAttributes pa{};
+            const cudaError_t r2 = cudaPointerGetAttributes(&pa, (void*) probe->exp_up);
+            // A mapped registration gives a device address that may differ from the host one (legacy registration
+            // maps it into a separate window): what has to hold is that the card can read it there.
+            ok = (r == cudaSuccess && dp != nullptr) || (r2 == cudaSuccess && pa.devicePointer != nullptr);
+            if (dp != (void*) probe->exp_up)
+                std::fprintf(stderr, "strata-poly: --pcie-mode %s: the pinned mapping is device-visible at %p "
+                                     "(host %p)\n", opt_.pcie_mode.c_str(), dp, (void*) probe->exp_up);
+            if (!ok) {
+                std::fprintf(stderr,
+                             "strata-poly: --pcie-mode %s probe: uva=%d hostGetDevicePointer=%s dp=%p host=%p "
+                             "pointerAttributes=%s type=%d dev=%p\n",
+                             opt_.pcie_mode.c_str(), uva, cudaGetErrorString(r), dp, (void*) probe->exp_up,
+                             cudaGetErrorString(r2), (int) pa.type, pa.devicePointer);
+            }
+            cudaGetLastError();
+        }
+        // the device aliases of every pinned layer's up and down regions, one lookup each (see the probe above)
+        if (ok) {
+            exp_up_dev_.assign(layers_.size(), nullptr);
+            exp_down_dev_.assign(layers_.size(), nullptr);
+            for (size_t il = 0; il < layers_.size() && ok; ++il) {
+                const Layer& L = layers_[il];
+                if (!L.moe || !L.exp_up || !L.exp_down || il >= pin_layer_.size() || !pin_layer_[il]) continue;
+                void* up = nullptr;
+                void* dn = nullptr;
+                if (cudaHostGetDevicePointer(&up, (void*) L.exp_up, 0) != cudaSuccess || up == nullptr ||
+                    cudaHostGetDevicePointer(&dn, (void*) L.exp_down, 0) != cudaSuccess || dn == nullptr) {
+                    ok = false;
+                    cudaGetLastError();
+                    break;
+                }
+                exp_up_dev_[il] = (const uint8_t*) up;
+                exp_down_dev_[il] = (const uint8_t*) dn;
+            }
+        }
+        pcie_direct_ = ok;
+        if (ok) {
+            std::fprintf(stderr, "strata-poly: --pcie-mode %s: the split's kernels will read the pinned experts in "
+                                 "place (zero copy, no staging slots or copies)\n", opt_.pcie_mode.c_str());
+        } else if (opt_.pcie_mode == "direct") {
+            throw std::runtime_error("--pcie-mode direct: this card cannot read the pinned host mapping in place "
+                                     "(no UVA or the mapping is not device-readable); use --pcie-mode auto or dma");
+        } else {
+            std::fprintf(stderr, "strata-poly: --pcie-mode auto: this card cannot read the pinned mapping in place; "
+                                 "falling back to dma\n");
+        }
+    }
     cover(1);   // a short conversation's rows, before the expert cache is sized
 
     // A prompt batch runs a layer's routed experts through MMQ when the card has a tile for each of their types
@@ -1851,7 +1921,16 @@ void Engine::alloc() {
         // cache's arena the way the split's copies will; with the switch at its default nothing is made and the run's
         // VRAM, cache and arithmetic are exactly what they were.  The slots are zeroed like the cache's (the kernels
         // read up to kTail past a matrix).
-        if (opt_.pcie_frac > 0.0) {
+        if (opt_.pcie_frac > 0.0 && pcie_direct_) {
+            // --pcie-mode direct: no slot and no copy - the kernels read the pinned mapping itself, so the split
+            // costs no VRAM at all (only the per-layer cap of --pcie-slots experts stays).
+            pcie_slots_ = opt_.pcie_slots;
+            for (const Layer& L : layers_)
+                if (L.moe) pcie_slot_bytes_ = std::max(pcie_slot_bytes_, expert_slot_bytes(L));
+            std::fprintf(stderr, "strata-poly: --pcie-frac %.3f (--pcie-mode %s): up to %d experts a layer read in "
+                                 "place from the pinned mapping; no staging slots, no copies\n",
+                         opt_.pcie_frac, opt_.pcie_mode.c_str(), pcie_slots_);
+        } else if (opt_.pcie_frac > 0.0) {
             for (const Layer& L : layers_)
                 if (L.moe) pcie_slot_bytes_ = std::max(pcie_slot_bytes_, expert_slot_bytes(L));
             pcie_slots_ = opt_.pcie_slots;
@@ -2166,6 +2245,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             const uint8_t* slot;
             float w;
             int row;
+            const uint8_t* down = nullptr;   // --pcie-mode direct: the down matrix where it is in the host mapping
         };
         CpuExpert host[kCpuRows * kMaxUsed];
         Cached cached[kCpuRows * kMaxUsed];
@@ -2221,9 +2301,14 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         const uint8_t* pcie_src_gate[kMaxPcie];
         const uint8_t* pcie_src_up[kMaxPcie];
         const uint8_t* pcie_src_down[kMaxPcie];
-        const bool pcie_ok = opt_.pcie_frac > 0.0 && pcie_stage_ != nullptr && pcie_st_ != nullptr &&
-                             ev_pcie_ != nullptr && pcie_slots_ > 0 && pcie_slot_bytes_ > 0 &&
-                             (size_t) il < pin_layer_.size() && pin_layer_[(size_t) il] != 0;
+        const bool direct = opt_.pcie_frac > 0.0 && pcie_direct_ && !L.gated && pcie_slots_ > 0 &&
+                            (size_t) il < pin_layer_.size() && pin_layer_[(size_t) il] != 0 &&
+                            (size_t) il < exp_up_dev_.size() && exp_up_dev_[(size_t) il] != nullptr &&
+                            exp_down_dev_[(size_t) il] != nullptr;
+        const bool pcie_ok = opt_.pcie_frac > 0.0 && pcie_slots_ > 0 && (size_t) il < pin_layer_.size() &&
+                             pin_layer_[(size_t) il] != 0 &&
+                             (direct || (pcie_stage_ != nullptr && pcie_st_ != nullptr && ev_pcie_ != nullptr &&
+                                         pcie_slot_bytes_ > 0));
         if (pcie_ok && n_host > 0) {
             const int pcie_num = std::min(256, (int) std::lround(std::min(opt_.pcie_frac, 1.0) * 256.0));
             const int m_uses = (int) (((long long) n_host * pcie_num) >> 8);
@@ -2240,6 +2325,14 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             }
             for (int j = 0; j < n_take; ++j) {
                 const size_t e = (size_t) take[j];
+                if (direct) {
+                    // read in place: no slot and no copy; the kernels take the device aliases of the pinned mapping
+                    pcie_dst[j] = nullptr;
+                    pcie_src_gate[j] = nullptr;
+                    pcie_src_up[j] = exp_up_dev_[(size_t) il] + e * L.gu_stride;
+                    pcie_src_down[j] = exp_down_dev_[(size_t) il] + e * L.d_bytes;
+                    continue;
+                }
                 pcie_dst[j] = pcie_stage_ + (size_t) j * pcie_slot_bytes_;
                 pcie_src_gate[j] = L.gated ? L.exp_gate + e * L.gu_stride : nullptr;
                 pcie_src_up[j] = L.exp_up + e * L.gu_stride;
@@ -2252,7 +2345,10 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 int q = -1;
                 for (int j = 0; j < n_take && q < 0; ++j) q = take[j] == host_e[i] ? j : -1;
                 if (q < 0) host[kept++] = host[i];
-                else pcie[n_pcie++] = {pcie_dst[q], host[i].weight, at + host[i].row};
+                else if (direct) {
+                    pcie[n_pcie++] = {pcie_src_up[q], host[i].weight, at + host[i].row, pcie_src_down[q]};
+                    ++stats_.pcie_direct;   // one use read in place; the DMAs stay 0 for it
+                } else pcie[n_pcie++] = {pcie_dst[q], host[i].weight, at + host[i].row};
             }
             n_host = kept;
             stats_.pcie_experts += n_pcie;
@@ -2273,7 +2369,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             if (first && at == 0) (*first)();
             // --pcie-frac: this block's copies go on their own stream now, so they fly beside the cached experts and
             // the CPU's work; the wait for them goes in just before the split's experts are computed at the end.
-            if (n_take > 0) {
+            if (n_take > 0 && !direct) {
                 for (int j = 0; j < n_take; ++j) {
                     uint8_t* const dst = pcie_dst[j];
                     if (L.gated)
@@ -2393,7 +2489,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             // kernel: the same native_mmvq* calls).  The wait is here, not before the cached loop, so the cached work
             // and the CPU's overlapped the copies.
             if (n_pcie > 0) {
-                ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_pcie_, 0), "PCIe staging");
+                if (!direct) ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_pcie_, 0), "PCIe staging");
                 ScaledRows psum{};
                 for (int i0 = 0; i0 < n_pcie; i0 += per) {
                     const int m = std::min(per, n_pcie - i0);
@@ -2403,7 +2499,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                         gate_up.w[j] = c.slot;
                         gate_up.x[j] = (const uint8_t*) xq_ + (size_t) c.row * xq_row;
                         gate_up.y[j] = g_ + (size_t) j * (L.gated ? 2 * ff : ff);
-                        down.w[j] = c.slot + L.slot_down();
+                        down.w[j] = c.down ? c.down : c.slot + L.slot_down();
                         down.x[j] = (const uint8_t*) q8_ + (size_t) j * q8_row;
                         down.y[j] = d_ + (size_t) ((i0 + j) % kSumRows) * e_row;
                     }
