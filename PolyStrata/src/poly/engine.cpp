@@ -206,12 +206,23 @@ void read_profile(const std::string& path, int n_layer, int n_expert, std::vecto
     int il = 0, e = 0;
     long long n = 0;
     long long loaded = 0;
+    int bad = 0;
     while (std::fscanf(f, "%d %d %lld", &il, &e, &n) == 3)
         if (il >= 0 && il < n_layer && e >= 0 && e < n_expert && n > 0) {
             out[(size_t) il * n_expert + e] = n;
             ++loaded;
+        } else {
+            ++bad;
         }
+    const bool malformed = std::feof(f) == 0;   // stopped on something that is not three ints
     std::fclose(f);
+    // A damaged table is refused, never used half-read (loud, not silent); the run continues unranked.
+    if (malformed || bad > 0) {
+        std::fprintf(stderr, "strata-poly: profile: REFUSED: %s: %s; running without a table\n", path.c_str(),
+                     malformed ? "not lines of 'layer expert count'" : "entry out of range");
+        out.clear();
+        return;
+    }
     std::fprintf(stderr, "strata-poly: profile: loaded %lld entries from %s\n", loaded, path.c_str());
 }
 
@@ -2169,7 +2180,26 @@ void Engine::plan_ahead(Layer& L, int il) {
         const int64_t* used = prior_.data() + (size_t) il * n_expert_;
         std::stable_sort(L.ahead.begin(), L.ahead.end(), [used](int32_t a, int32_t b) { return used[a] > used[b]; });
     }
-    L.ahead.resize(std::min(L.ahead.size(), stage_bytes_ / (2 * L.gu_bytes + L.d_bytes)));
+    // STRATA_AHEAD_EXACT=1: the buffer holds what stage() writes for an expert - the expert's own slot layout,
+    // slot_down() + d_bytes (for a gated expert that is gate+up+down; for Nemotron's non-gated one, up+down) -
+    // not the gated worst case 2*gu_bytes + d_bytes. On this model that is 341 -> 512 experts ahead in the same
+    // 1512 MiB buffer: no extra VRAM, only the list the stage() DMA fills under the layer's attention grows.
+    // Off (the default): the release path's 2*gu_bytes + d_bytes, byte for byte the list it was.
+    static const bool ahead_exact = [] {
+        const char* e = std::getenv("STRATA_AHEAD_EXACT");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    const size_t per_expert = ahead_exact ? L.slot_down() + L.d_bytes : 2 * (size_t) L.gu_bytes + L.d_bytes;
+    const size_t cap = std::min<size_t>((size_t) n_expert_, stage_bytes_ / std::max<size_t>(per_expert, 1));
+    L.ahead.resize(std::min(L.ahead.size(), cap));
+    if (ahead_exact) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr,
+                         "plan_ahead: %zu experts ahead (footprint %.2f MB/expert, %s layout; %.0f MiB staging)\n", cap,
+                         (double) per_expert / (1024.0 * 1024.0), L.gated ? "gated" : "actual (up+down)",
+                         (double) (stage_bytes_ >> 20));
+    }
 }
 
 // The follower: an asked-for expert goes from the mapped file to its pinned buffer, and from there to its slot.
@@ -2538,6 +2568,45 @@ void Engine::load(const Options& o) {
     // Stage D: the sidecar is pinned and faulted in BEFORE alloc()/pin_expert_arena(), so that pin's floor subtracts it.
     relu2_down_open();
     alloc();
+    // STRATA_PROFILE_AUTO_LEARN=1: no table yet -> learn this run's answers and write it back on exit / after
+    // each answer (--serve).  The first run is the slow one; the next start loads the same path and is faster.
+    // Default 0 keeps every release behaviour: with it unset this block only reads a table if one is given.
+    {
+        static const bool auto_learn = [] {
+            const char* e = std::getenv("STRATA_PROFILE_AUTO_LEARN");
+            return e && e[0] == '1' && e[1] == '\0';
+        }();
+        static const bool decode_only_env = [] {
+            const char* e = std::getenv("STRATA_PROFILE_DECODE_ONLY");
+            return e && e[0] == '1' && e[1] == '\0';
+        }();
+        bool empty = true;
+        if (!opt_.profile.empty()) {
+            std::error_code ec;
+            const auto sz = std::filesystem::exists(opt_.profile, ec) ? std::filesystem::file_size(opt_.profile, ec) : 0;
+            empty = ec || sz == 0;
+        }
+        if (auto_learn && !opt_.profile.empty()) {
+            // A seeded table continues to learn too: without this a shipped starter table would never grow.
+            opt_.profile_write = true;
+            profile_auto_learn_ = true;
+            // The counts auto-learn writes/accumulates are the ANSWERS' routing in both cases: a seeded table is a
+            // decode-only table (the shipped one is), and mixing prompt counts back in is what made p_deliver drag
+            // the decode ranking (R76b: hit 51.2% seeded vs 76.4% decode-only).
+            profile_decode_only_ = true;
+            if (empty)
+                std::fprintf(stderr,
+                             "strata-poly: profile: auto-learn on (no table at %s; learning from this run; the "
+                             "first run is ~10%% slower, the next ones gain 15-40%% on template-like loads)\n",
+                             opt_.profile.c_str());
+            else
+                std::fprintf(stderr,
+                             "strata-poly: profile: auto-learn on (seeded table at %s; continuing to learn)\n",
+                             opt_.profile.c_str());
+        } else {
+            profile_decode_only_ = decode_only_env;   // the switch that already existed, unchanged
+        }
+    }
     if (!opt_.profile.empty()) read_profile(opt_.profile, (int) layers_.size(), n_expert_, prior_);
     fill_expert_cache();
     // STRATA_PROMPT_BORROW: the staging buffers the fill lent a region of the cache's tail are pointed at it now:
@@ -3005,7 +3074,7 @@ void Engine::save_profile() const {
     // STRATA_PROFILE_DECODE_ONLY=1: the table is the answer's counts alone (the prompt's were 98.26% of every count
     // the table was built from and did not match the decode distribution).  Off (the default): the counts are the
     // ones it always wrote - the two sides added - so the release path is byte for byte the one it was.
-    static const bool decode_only = [] {
+    const bool decode_only = profile_decode_only_ || [] {
         const char* e = std::getenv("STRATA_PROFILE_DECODE_ONLY");
         return e && e[0] == '1' && e[1] == '\0';
     }();

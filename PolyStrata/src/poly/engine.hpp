@@ -875,6 +875,10 @@ protected:
     // table was built from).  use_ still counts both, so everything that orders or moves the cache reads exactly
     // what it always did; only save_profile() picks a side.
     std::vector<int64_t> use_decode_, use_prefill_;
+    // STRATA_PROFILE_AUTO_LEARN=1: a missing/empty --expert-profile is learnt from this run's answers (decode
+    // counts) and written back; the next start loads the same path and is faster.  Default 0: unchanged.
+    bool profile_auto_learn_ = false;
+    bool profile_decode_only_ = false;
     // STRATA_DUMP_ROUTE=1: one line a routed (layer, token): "il token id0 .. id21", for the offline 1.6/1.7
     // accuracy gate.  Default 0: no file, no writes, the routed path byte for byte unchanged.
     FILE* route_dump_ = nullptr;
